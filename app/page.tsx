@@ -68,8 +68,8 @@ export default function Home() {
 
         {results && !answer && (
           <p className="text-xs text-zinc-500">
-            (NVIDIA_API_KEY가 설정되지 않아 생성된 답변 없이 검색 결과만
-            보여줍니다.)
+            (AI 답변 생성에 실패해 검색된 조항만 보여줍니다. 잠시 후 다시
+            시도해보세요.)
           </p>
         )}
 

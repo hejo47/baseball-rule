@@ -12,6 +12,10 @@ function getClient(): OpenAI | null {
   return new OpenAI({
     apiKey,
     baseURL: "https://integrate.api.nvidia.com/v1",
+    // 무료 API가 종종 응답을 아예 주지 않는다. 그때 서버가 같이 멈추지
+    // 않도록 끊고, 검색 결과만이라도 돌려준다.
+    timeout: 25_000,
+    maxRetries: 1,
   });
 }
 
