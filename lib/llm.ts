@@ -4,7 +4,8 @@ import type { SearchResult } from "@/lib/search";
 // NVIDIA build.nvidia.com은 OpenAI 호환 엔드포인트를 무료로 제공한다.
 // https://build.nvidia.com/models 에서 API 키를 받아 NVIDIA_API_KEY로 설정하면 된다.
 const MODEL = process.env.NVIDIA_MODEL ?? "openai/gpt-oss-120b";
-const CONTEXT_LIMIT = 20;
+// 조항 하나가 2,500자까지 되므로 너무 많이 넘기면 응답이 크게 느려진다.
+const CONTEXT_LIMIT = 8;
 
 function getClient(): OpenAI | null {
   const apiKey = process.env.NVIDIA_API_KEY;
