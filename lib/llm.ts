@@ -3,7 +3,7 @@ import type { SearchResult } from "@/lib/search";
 
 // NVIDIA build.nvidia.com은 OpenAI 호환 엔드포인트를 무료로 제공한다.
 // https://build.nvidia.com/models 에서 API 키를 받아 NVIDIA_API_KEY로 설정하면 된다.
-const MODEL = process.env.NVIDIA_MODEL ?? "openai/gpt-oss-120b";
+const MODEL = process.env.NVIDIA_MODEL ?? "openai/gpt-oss-20b";
 // 조항 하나가 2,500자까지 되므로 너무 많이 넘기면 응답이 크게 느려진다.
 const CONTEXT_LIMIT = 8;
 
@@ -15,8 +15,10 @@ function getClient(): OpenAI | null {
     baseURL: "https://integrate.api.nvidia.com/v1",
     // 무료 API가 종종 응답을 아예 주지 않는다. 그때 서버가 같이 멈추지
     // 않도록 끊고, 검색 결과만이라도 돌려준다.
-    timeout: 25_000,
-    maxRetries: 1,
+    // 추론 모델은 답변 전에 생각하는 데만 20초 넘게 걸리기도 해서,
+    // route의 maxDuration(60s) 안에서 재시도 없이 넉넉히 기다린다.
+    timeout: 55_000,
+    maxRetries: 0,
   });
 }
 
