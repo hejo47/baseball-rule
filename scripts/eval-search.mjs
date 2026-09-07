@@ -8,10 +8,17 @@
  * data/testset.json의 질문마다 정답 조항이 검색 결과 몇 등에 나오는지 재고,
  * 상위 N개(LLM에 넘기는 개수) 안에 들어왔는지 집계한다.
  * 검색 방식을 바꾼 뒤 이 점수가 올랐는지로 개선 여부를 판단한다.
+ *
+ * 결과는 results/search-<메모>-<시각>.json에 남는다. 두 번째 인자로 메모를
+ * 붙이면 무엇을 바꾼 측정인지 파일 이름에 남는다.
+ *
+ *   node scripts/eval-search.mjs http://localhost:3000 기준선
  */
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 
 const BASE = process.argv[2] ?? "http://localhost:3000";
+// 파일 이름에 남길 메모 (무엇을 바꾼 측정인지)
+const NOTE = process.argv[3] ?? "측정";
 // lib/llm.ts의 CONTEXT_LIMIT과 같은 값이어야 한다.
 const CONTEXT_LIMIT = 8;
 
@@ -44,7 +51,7 @@ for (const { q, expect, level } of testset) {
 
   // 함정 문제: 정답 조항이 없는 게 정답이라 순위 채점에서 제외한다.
   if (best === null) {
-    rows.push({ q, level, rank: "-", status: "함정(정답 없음)" });
+    rows.push({ q, expect, level, rank: "-", status: "함정(정답 없음)" });
     continue;
   }
 
@@ -81,3 +88,22 @@ console.log(`채점 대상            : ${scored}문제`);
 console.log(`1등으로 찾음         : ${top1}/${scored} (${((top1 / scored) * 100).toFixed(0)}%)`);
 console.log(`상위 ${CONTEXT_LIMIT}개 안에 들어옴   : ${inContext}/${scored} (${((inContext / scored) * 100).toFixed(0)}%)  <- LLM이 볼 수 있는 범위`);
 console.log(`아예 못 찾음         : ${missing}/${scored}`);
+
+// 조항을 몇 개까지 LLM에 넘길지 정할 때 쓰는 표.
+const ranked = rows.filter((r) => r.rank !== "-").map((r) => (r.rank === "없음" ? Infinity : r.rank));
+const recall = {};
+console.log("\n상위 N개 안에 정답이 들어오는 비율");
+for (const n of [5, 8, 12, 16, 20, 30]) {
+  const hit = ranked.filter((r) => r <= n).length;
+  recall[n] = hit;
+  console.log(`  상위 ${String(n).padStart(2)}개: ${String(hit).padStart(2)}/${scored} (${((hit / scored) * 100).toFixed(0)}%)`);
+}
+
+const stamp = new Date().toISOString().slice(0, 16).replace(/[:T-]/g, "");
+const name = `search-${NOTE}-${stamp}.json`;
+await mkdir(new URL("../results/", import.meta.url), { recursive: true });
+await writeFile(
+  new URL(`../results/${name}`, import.meta.url),
+  JSON.stringify({ base: BASE, note: NOTE, contextLimit: CONTEXT_LIMIT, scored, top1, inContext, missing, recall, rows }, null, 2),
+);
+console.log(`\n결과 저장: results/${name}`);
