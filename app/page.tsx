@@ -13,6 +13,8 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [answerLoading, setAnswerLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // AI 답변만 실패했을 때 그 이유 (검색 결과는 그대로 보여준다)
+  const [answerError, setAnswerError] = useState<string | null>(null);
   // 길게 잘린 조항 중 사용자가 펼쳐본 것들의 id
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
@@ -33,6 +35,7 @@ export default function Home() {
     setError(null);
     setResults(null);
     setAnswer(null);
+    setAnswerError(null);
     setExpanded(new Set());
 
     // 검색과 AI 답변을 동시에 요청한다. 답변 쪽이 훨씬 오래 걸리므로
@@ -67,7 +70,13 @@ export default function Home() {
     setAnswerLoading(true);
     try {
       const res = await answerPromise;
-      if (!res.ok || !res.body) throw new Error("답변 생성 실패");
+      if (!res.ok) {
+        // 라우트가 실패 이유를 담아 보낸다. 그대로 보여줘야 무엇을
+        // 고쳐야 할지(키, 모델 이름, 사용량) 알 수 있다.
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error ?? `답변 생성 실패 (${res.status})`);
+      }
+      if (!res.body) throw new Error("답변 생성 실패");
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -80,8 +89,9 @@ export default function Home() {
       }
       text += decoder.decode();
       setAnswer(text.trim() || null);
-    } catch {
+    } catch (err) {
       setAnswer(null);
+      setAnswerError(err instanceof Error ? err.message : "답변 생성 실패");
     } finally {
       setAnswerLoading(false);
     }
@@ -127,8 +137,9 @@ export default function Home() {
 
         {results && !answer && !answerLoading && (
           <p className="text-xs text-zinc-500">
-            (AI 답변 생성에 실패해 검색된 조항만 보여줍니다. 잠시 후 다시
-            시도해보세요.)
+            {answerError
+              ? `AI 답변 실패: ${answerError} 검색된 조항만 보여줍니다.`
+              : "(AI 답변을 만들지 못해 검색된 조항만 보여줍니다.)"}
           </p>
         )}
 

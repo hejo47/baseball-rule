@@ -1,5 +1,5 @@
 import { search } from "@/lib/search";
-import { streamAnswer } from "@/lib/llm";
+import { AnswerError, openAnswerStream, readAnswerStream } from "@/lib/llm";
 
 // Vercel 무료 플랜의 기본 함수 실행 제한은 짧다. LLM 응답을 기다릴 수 있도록 늘린다.
 export const maxDuration = 60;
@@ -22,16 +22,30 @@ export async function POST(request: Request) {
     );
   }
 
+  // 스트림을 먼저 연다. 여기서 실패하면(키 없음, 모델 종료 등) 아직
+  // 상태 코드를 붙일 수 있어서, 화면이 이유를 그대로 보여줄 수 있다.
+  let answer;
+  try {
+    answer = await openAnswerStream(message, search(message));
+  } catch (err) {
+    console.error("openAnswerStream failed:", err);
+    const known = err instanceof AnswerError;
+    return Response.json(
+      { error: known ? err.message : "답변을 만들지 못했습니다." },
+      { status: known ? err.status : 502 },
+    );
+  }
+
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        for await (const piece of streamAnswer(message, search(message))) {
+        for await (const piece of readAnswerStream(answer)) {
           controller.enqueue(encoder.encode(piece));
         }
       } catch (err) {
         // 이미 내보낸 부분까지는 화면에 남는다. 나머지는 포기하고 닫는다.
-        console.error("streamAnswer failed:", err);
+        console.error("readAnswerStream failed:", err);
       }
       controller.close();
     },
