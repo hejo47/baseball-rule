@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "eval:search": "node scripts/eval-search.mjs",
+    "eval:answer": "node scripts/eval-answer.mjs"
   },
   "dependencies": {
     "next": "16.3.4",
