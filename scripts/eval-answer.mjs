@@ -1,5 +1,5 @@
 /**
- * AI 답변 생성 속도 측정 스크립트
+ * AI 답변 정확도 + 속도 측정 스크립트
  *
  *   npm run dev                          (다른 터미널에서 켜두고)
  *   node scripts/eval-answer.mjs                 지금 설정으로 측정
@@ -7,10 +7,12 @@
  *   node scripts/eval-answer.mjs --limit 5       앞의 5문항만
  *
  * data/testset.json의 질문마다 실제 /api/search로 조항을 뽑고, 그 조항으로
- * 모델을 직접 호출해 (1) 첫 글자가 화면에 뜨기까지 (2) 답변이 끝나기까지
- * 걸린 시간을 잰다. 결과는 results/answer-<프리셋>-<시각>.json에 남는다.
+ * 모델을 직접 호출해 (1) 답이 맞았는지 (2) 첫 글자가 뜨기까지 (3) 답변이
+ * 끝나기까지를 잰다. 결과는 results/answer-<프리셋>-<시각>.json에 남는다.
  *
- * 검색 정확도는 scripts/eval-search.mjs가 따로 잰다. 이 스크립트는 속도만 본다.
+ * 검색 순위만 보는 채점은 scripts/eval-search.mjs가 따로 한다. 그쪽이
+ * 만점이어도 모델이 엉뚱한 조항을 인용하거나 지어낼 수 있어서, 최종 답변을
+ * 따로 채점해야 "정확도"를 올렸는지 알 수 있다.
  */
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import OpenAI from "openai";
@@ -19,7 +21,8 @@ const BASE = process.env.EVAL_BASE ?? "http://localhost:3000";
 // 사용자가 기다려주는 한계. 넘기면 끊고 "미완"으로 기록해 측정 시간을 아낀다.
 const PATIENCE_MS = 20_000;
 // lib/llm.ts의 CONTEXT_LIMIT과 같은 값이어야 한다.
-const CONTEXT_LIMIT = 8;
+// --context N 으로 덮어써서 "조항을 몇 개 넘기는 게 좋은가"를 실험할 수 있다.
+const DEFAULT_CONTEXT_LIMIT = 8;
 
 // lib/llm.ts를 고칠 때 여기 current도 같이 고쳐야 비교가 의미 있다.
 const PRESETS = {
@@ -42,15 +45,21 @@ const PRESETS = {
 const args = process.argv.slice(2);
 const limitAt = args.indexOf("--limit");
 const LIMIT = limitAt === -1 ? Infinity : Number(args[limitAt + 1]);
+const ctxAt = args.indexOf("--context");
+const CONTEXT_LIMIT = ctxAt === -1 ? DEFAULT_CONTEXT_LIMIT : Number(args[ctxAt + 1]);
 const names = args.filter((a) => PRESETS[a]);
-const RUN = names.length ? names : ["current"];
+// 채점 기준을 고쳤을 때, 모델을 다시 부르지 않고 지난 측정을 다시 채점한다.
+// 답변 본문이 결과 파일에 그대로 남아 있어서 재채점만 하면 된다.
+const regradeAt = args.indexOf("--regrade");
+const REGRADE = regradeAt === -1 ? null : args[regradeAt + 1];
+let RUN = names.length ? names : ["current"];
 
 try {
   process.loadEnvFile(new URL("../.env.local", import.meta.url).pathname);
 } catch {
   // 이미 환경변수로 넣어뒀다면 파일이 없어도 된다.
 }
-if (!process.env.NVIDIA_API_KEY) {
+if (!REGRADE && !process.env.NVIDIA_API_KEY) {
   console.error("NVIDIA_API_KEY가 없습니다. .env.local을 확인하세요.");
   process.exit(1);
 }
@@ -66,7 +75,115 @@ const MODEL = process.env.NVIDIA_MODEL ?? "openai/gpt-oss-20b";
 const testset = JSON.parse(
   await readFile(new URL("../data/testset.json", import.meta.url), "utf8"),
 );
+const rules = JSON.parse(
+  await readFile(new URL("../data/rules.json", import.meta.url), "utf8"),
+);
 const questions = testset.slice(0, LIMIT);
+
+// ------------------------------------------------------------- 인용 채점
+
+const RULE_IDS = rules.map((r) => r.id);
+
+// 모델이 "정의-30"을 "정의‑30"(U+2011 등 유니코드 하이픈)으로 적는 일이 잦다.
+// 눈으로는 같은 글자라 인용을 놓친 줄도 모르고 오답으로 셌었다.
+const DASHES = /[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g;
+
+const normId = (s) =>
+  String(s).replace(DASHES, "-").replace(/\s+/g, "").replace(/[.·,]+$/, "");
+
+/**
+ * 두 조항 번호가 같은 곳을 가리키는지 본다.
+ *
+ * 모델이 5.05⑵ 대신 5.05처럼 상위 번호만 적는 일이 잦다. 규칙집은 긴
+ * 조항을 하위 항목으로 쪼개 색인해서 "5.05"라는 id 자체가 없는데, 이걸
+ * 지어낸 번호로 세면 환각 수치가 부풀려진다. 한쪽이 다른 쪽으로 시작하면
+ * 같은 조항을 가리킨 것으로 본다.
+ */
+function relates(a, b) {
+  const x = normId(a);
+  const y = normId(b);
+  return x === y || x.startsWith(y) || y.startsWith(x);
+}
+
+/**
+ * 답변에서 대괄호로 표기된 조항 번호를 모은다.
+ *
+ * 프롬프트가 [5.05⑵] 꼴을 요구하지만 실제로는 [5.06⒞, 5.09⒠]처럼 묶어
+ * 적거나 [규칙 5.11]처럼 군더더기를 붙이는 경우가 있어 느슨하게 판다.
+ * 조항 번호처럼 생기지 않은 대괄호([주1] 등)는 버린다.
+ */
+function parseCitations(text) {
+  const out = [];
+  for (const [, raw] of text.matchAll(/\[([^\]\n]{1,80})\]/g)) {
+    const inner = raw.replace(DASHES, "-");
+    for (const piece of inner.split(/[,;·]|\s{2,}/)) {
+      const m = piece.match(/(정의\s*-\s*\d{1,3}|\d{1,2}\.\d{2}[⒜-⒵⑴-⒇]*)/);
+      if (m) out.push(normId(m[1]));
+    }
+  }
+  return [...new Set(out)];
+}
+
+const REFUSAL = /찾지\s*못했|찾을\s*수\s*없|규칙집에\s*없/;
+
+/**
+ * 답변 하나를 채점한다.
+ *
+ * 틀린 답을 "검색 탓"과 "모델 탓"으로 갈라놓는 게 핵심이다. 정답 조항을
+ * 애초에 안 넘겨줬으면 검색을 고쳐야 하고, 넘겨줬는데도 안 썼으면 프롬프트나
+ * 모델을 고쳐야 해서 할 일이 완전히 달라진다.
+ */
+function grade({ expect, text, contextIds }) {
+  // 모델이 추론만 하다 끝나 본문을 한 글자도 안 뱉는 경우가 있다.
+  // 인용이 없다는 점에서는 오답과 같지만 고칠 곳이 달라 따로 센다.
+  if (!text.trim()) {
+    return { verdict: "빈답변", correct: false, cited: [], invented: [], outside: [], searchMissed: false };
+  }
+
+  const cited = parseCitations(text);
+  const refused = REFUSAL.test(text);
+
+  // 지어낸 번호: 규칙집에 그런 조항이 아예 없다.
+  const invented = cited.filter((c) => !RULE_IDS.some((id) => relates(c, id)));
+  // 넘겨주지 않은 조항을 끌어다 썼다. 규칙집엔 있지만 근거로 본 적은 없는 것.
+  const outside = cited.filter(
+    (c) => !invented.includes(c) && !contextIds.some((id) => relates(c, id)),
+  );
+
+  // 함정 문제: 정답 조항이 없는 게 정답이다.
+  if (expect.length === 0) {
+    return {
+      verdict: refused ? "정답" : "지어냄",
+      correct: refused,
+      cited,
+      invented,
+      outside,
+      searchMissed: false,
+    };
+  }
+
+  const searchMissed = !expect.some((e) => contextIds.some((c) => relates(c, e)));
+  const exact = expect.some((e) => cited.some((c) => normId(c) === normId(e)));
+  const partial = !exact && expect.some((e) => cited.some((c) => relates(c, e)));
+
+  let verdict;
+  if (exact) verdict = "정답";
+  else if (partial) verdict = "부분";       // 상위 번호만 적음 (5.05⑵ -> 5.05)
+  else if (searchMissed) verdict = "검색실패"; // 근거를 못 받았으니 모델 탓이 아니다
+  else if (refused) verdict = "포기";        // 근거를 받고도 못 찾았다고 답함
+  else verdict = "놓침";                     // 근거를 받고도 엉뚱한 조항을 인용
+
+  return {
+    verdict,
+    correct: exact || partial,
+    cited,
+    invented,
+    outside,
+    searchMissed,
+  };
+}
+
+// ------------------------------------------------------------- 측정
 
 async function searchApi(message) {
   const res = await fetch(`${BASE}/api/search`, {
@@ -138,14 +255,35 @@ async function measure(prompt, params) {
 }
 
 const rows = [];
-for (const { q, level } of questions) {
+
+if (REGRADE) {
+  // 경로는 절대경로이거나 프로젝트 루트 기준 상대경로(results/...)로 받는다.
+  const src = REGRADE.startsWith("/")
+    ? REGRADE
+    : new URL(`../${REGRADE}`, import.meta.url);
+  const past = JSON.parse(await readFile(src, "utf8"));
+  RUN = past.presets;
+  for (const row of past.rows) {
+    const next = { ...row, runs: {} };
+    for (const name of RUN) {
+      const run = row.runs[name];
+      next.runs[name] = run?.error
+        ? run
+        : { ...run, ...grade({ expect: row.expect, text: run.text, contextIds: row.contextIds }) };
+    }
+    rows.push(next);
+  }
+} else
+for (const { q, expect, level } of questions) {
   const results = await searchApi(q);
-  const row = { q, level, runs: {} };
+  const contextIds = results.slice(0, CONTEXT_LIMIT).map((r) => r.id);
+  const row = { q, level, expect, contextIds, runs: {} };
 
   for (const name of RUN) {
     const { tail, params } = PRESETS[name];
     try {
-      row.runs[name] = await measure(buildPrompt(q, results, tail), params);
+      const run = await measure(buildPrompt(q, results, tail), params);
+      row.runs[name] = { ...run, ...grade({ expect, text: run.text, contextIds }) };
     } catch (err) {
       row.runs[name] = { error: String(err.message).slice(0, 200) };
     }
@@ -155,6 +293,8 @@ for (const { q, level } of questions) {
 }
 process.stderr.write("\n\n");
 
+// ------------------------------------------------------------- 출력
+
 const width = (s, n) => {
   s = String(s);
   let len = 0;
@@ -162,24 +302,25 @@ const width = (s, n) => {
   return s + " ".repeat(Math.max(0, n - len));
 };
 
-// 한 칸에 들어갈 요약. 20초를 넘겨 끊긴 경우는 시간 대신 그 사실을 적는다.
+// 한 칸에 들어갈 요약. 판정을 앞에, 걸린 시간을 뒤에 적는다.
 const cell = (r) => {
   if (!r) return "-";
   if (r.error) return "에러";
-  if (r.cut) return r.chars ? `20초+ (${(r.ttft / 1000).toFixed(1)}s부터 표시)` : "20초+ 표시 없음";
+  if (r.cut) return `20초+ ${r.verdict ?? ""}`.trim();
   if (!r.chars) return `${(r.total / 1000).toFixed(1)}s 빈 답변`;
-  return `${(r.total / 1000).toFixed(1)}s (첫글자 ${(r.ttft / 1000).toFixed(1)}s)`;
+  const flag = r.invented.length ? "+지어냄" : r.outside.length ? "+밖인용" : "";
+  return `${r.verdict}${flag} ${(r.total / 1000).toFixed(1)}s`;
 };
 
-console.log(`대상: ${BASE} · 모델: ${MODEL} · ${questions.length}문항 · 대기 한계 ${PATIENCE_MS / 1000}초\n`);
-console.log(width("질문", 34) + width("난이도", 8) + RUN.map((n) => width(PRESETS[n].label, 30)).join(""));
-console.log("-".repeat(34 + 8 + 30 * RUN.length));
+console.log(`대상: ${BASE} · 모델: ${MODEL} · ${questions.length}문항 · 조항 ${CONTEXT_LIMIT}개 · 대기 한계 ${PATIENCE_MS / 1000}초\n`);
+console.log(width("질문", 34) + width("난이도", 8) + RUN.map((n) => width(PRESETS[n].label, 22)).join(""));
+console.log("-".repeat(34 + 8 + 22 * RUN.length));
 for (const row of rows) {
   console.log(
-    width(row.q, 34) + width(row.level ?? "", 8) + RUN.map((n) => width(cell(row.runs[n]), 30)).join(""),
+    width(row.q, 34) + width(row.level ?? "", 8) + RUN.map((n) => width(cell(row.runs[n]), 22)).join(""),
   );
 }
-console.log("-".repeat(34 + 8 + 30 * RUN.length));
+console.log("-".repeat(34 + 8 + 22 * RUN.length));
 
 const summaries = {};
 for (const name of RUN) {
@@ -187,9 +328,21 @@ for (const name of RUN) {
   const done = rs.filter((r) => !r.cut && r.chars > 0);
   const shown = rs.filter((r) => r.chars > 0);
   const avg = (list, f) => (list.length ? list.reduce((a, r) => a + f(r), 0) / list.length : 0);
+  const count = (v) => rs.filter((r) => r.verdict === v).length;
+  const pct = (n) => `${n}/${rs.length} (${((n / (rs.length || 1)) * 100).toFixed(0)}%)`;
 
   const summary = {
     문항: rs.length,
+    맞힌_문항: rs.filter((r) => r.correct).length,
+    정답: count("정답"),
+    부분정답: count("부분"),
+    놓침_모델탓: count("놓침"),
+    포기_모델탓: count("포기"),
+    검색실패_검색탓: count("검색실패"),
+    지어냄_함정오답: count("지어냄"),
+    빈답변: count("빈답변"),
+    없는조항_지어냄: rs.filter((r) => r.invented?.length).length,
+    컨텍스트밖_인용: rs.filter((r) => r.outside?.length).length,
     "20초 안에 답변 완료": done.length,
     "20초 안에 첫 글자 표시": shown.length,
     "완료된 것의 평균 시간(초)": Number((avg(done, (r) => r.total) / 1000).toFixed(1)),
@@ -199,15 +352,30 @@ for (const name of RUN) {
   summaries[name] = summary;
 
   console.log(`\n[${PRESETS[name].label}] ${PRESETS[name].note}`);
-  for (const [k, v] of Object.entries(summary)) {
-    if (k === "문항") continue;
+  console.log(`  ── 정확도 ──`);
+  console.log(`  ${width("맞힘(정답+부분)", 26)}: ${pct(summary.맞힌_문항)}`);
+  console.log(`  ${width("  정답 조항 정확히 인용", 26)}: ${summary.정답}`);
+  console.log(`  ${width("  상위 번호만 인용", 26)}: ${summary.부분정답}`);
+  console.log(`  ${width("틀림 - 모델 탓", 26)}: ${summary.놓침_모델탓 + summary.포기_모델탓 + summary.지어냄_함정오답 + summary.빈답변}`);
+  console.log(`  ${width("  근거 받고도 엉뚱한 인용", 26)}: ${summary.놓침_모델탓}`);
+  console.log(`  ${width("  근거 받고도 못 찾겠다 함", 26)}: ${summary.포기_모델탓}`);
+  console.log(`  ${width("  함정에 답을 지어냄", 26)}: ${summary.지어냄_함정오답}`);
+  console.log(`  ${width("  답변이 비어 있음", 26)}: ${summary.빈답변}`);
+  console.log(`  ${width("틀림 - 검색 탓", 26)}: ${summary.검색실패_검색탓}`);
+  console.log(`  ${width("없는 조항 번호 지어냄", 26)}: ${summary.없는조항_지어냄}`);
+  console.log(`  ${width("안 넘긴 조항 끌어다 씀", 26)}: ${summary.컨텍스트밖_인용}`);
+  console.log(`  ── 속도 ──`);
+  for (const k of ["20초 안에 답변 완료", "20초 안에 첫 글자 표시", "완료된 것의 평균 시간(초)", "첫 글자까지 평균(초)", "평균 답변 길이(자)"]) {
     const suffix = k.startsWith("20초") ? `/${summary.문항}` : "";
-    console.log(`  ${width(k, 26)}: ${v}${suffix}`);
+    console.log(`  ${width(k, 26)}: ${summary[k]}${suffix}`);
   }
 }
 
 const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "").replace(/-/g, "");
-const out = new URL(`../results/answer-${RUN.join("-")}-${stamp}.json`, import.meta.url);
+const out = new URL(
+  `../results/answer-${RUN.join("-")}-조항${CONTEXT_LIMIT}개${REGRADE ? "-재채점" : ""}-${stamp}.json`,
+  import.meta.url,
+);
 await mkdir(new URL("../results/", import.meta.url), { recursive: true });
-await writeFile(out, JSON.stringify({ base: BASE, model: MODEL, patienceMs: PATIENCE_MS, presets: RUN, summaries, rows }, null, 2));
-console.log(`\n결과 저장: results/${out.pathname.split("/").pop()}`);
+await writeFile(out, JSON.stringify({ base: BASE, model: MODEL, patienceMs: PATIENCE_MS, contextLimit: CONTEXT_LIMIT, presets: RUN, summaries, rows }, null, 2));
+console.log(`\n결과 저장: results/${decodeURIComponent(out.pathname.split("/").pop())}`);
