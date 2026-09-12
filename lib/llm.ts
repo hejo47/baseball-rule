@@ -24,6 +24,22 @@ function getClient(): OpenAI | null {
   });
 }
 
+// 질문이 용어의 뜻을 묻는가, 상황·조건을 묻는가.
+//
+// 둘은 좋은 답의 모양이 다르다. "폭투가 뭐야?"는 규칙집 문장을 그대로
+// 옮겨주는 게 가장 정확하고, "언제 선언돼?"는 여러 조항의 조건을 모아
+// 정리해줘야 한다. 같은 지시를 양쪽에 주면 한쪽이 망가진다.
+//
+// 측정(260912): 문장을 그대로 옮기게 하자 단어형은 채점 항목 38/40 -> 40/40이
+// 됐는데(나빠진 문항 0개), 의미형은 30/39 그대로였다(좋아진 1건과 나빠진 1건이
+// 상쇄). 그래서 단어형에만 건다. 답변이 길어지는 속도 비용도 절반만 낸다.
+const ASKS_CASE = /(언제|경우|어떻게|몇 번|조건|하면|되나|절차|신청)/;
+const ASKS_TERM = /(뭐야|뭔가|무엇|이란|란\?|어디까지|몇 초)/;
+
+function asksTerm(question: string): boolean {
+  return ASKS_TERM.test(question) && !ASKS_CASE.test(question);
+}
+
 function buildPrompt(question: string, results: SearchResult[]): string {
   const context = results
     .slice(0, CONTEXT_LIMIT)
@@ -34,7 +50,13 @@ function buildPrompt(question: string, results: SearchResult[]): string {
 이 조항들만 근거로 질문에 답하라.
 조항에 없는 내용은 추측하지 말고 "규칙집에서 찾지 못했습니다"라고 답하라.
 근거가 어느 문서에서 왔는지 답변에 밝혀라. 야구규칙과 리그 규정은 다른 문서다.
-3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.
+${
+    asksTerm(question)
+      ? `질문의 핵심 단어가 들어간 조항 문장은 요약하지 말고 그대로 옮겨 적어라.
+그 문장에 있는 조건, 숫자, 예외를 하나도 빼지 마라.
+그런 다음 3~5문장으로 풀어서 설명하라. 표는 쓰지 말고 줄글로 쓴다.`
+      : `3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.`
+  }
 답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).
 
 # 검색된 조항
@@ -113,7 +135,11 @@ export async function openAnswerStream(question: string, results: SearchResult[]
     return await client.chat.completions.create({
       model: MODEL,
       messages: [{ role: "user", content: buildPrompt(question, results) }],
-      temperature: 0.2,
+      // 규칙집 문장을 정확히 옮기는 일이라 매번 다르게 쓸 이유가 없다.
+      // 0.2에서는 같은 질문에 답이 매번 달라져, 프롬프트를 고쳤을 때
+      // 좋아진 것인지 운인지 구분할 수 없었다. 사용자 입장에서도 어제 물은
+      // 답과 오늘 답이 달라지는 건 규칙 설명으로 곤란하다.
+      temperature: 0,
       max_tokens: MAX_TOKENS,
       // 작은 모델이 같은 문장을 무한 반복하는 것을 막는다.
       frequency_penalty: 0.5,

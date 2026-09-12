@@ -24,6 +24,10 @@ const PATIENCE_MS = 20_000;
 // --context N 으로 덮어써서 "조항을 몇 개 넘기는 게 좋은가"를 실험할 수 있다.
 const DEFAULT_CONTEXT_LIMIT = 8;
 
+// lib/llm.ts의 asksTerm과 같아야 한다.
+const ASKS_CASE = /(언제|경우|어떻게|몇 번|조건|하면|되나|절차|신청)/;
+const ASKS_TERM = /(뭐야|뭔가|무엇|이란|란\?|어디까지|몇 초)/;
+
 // lib/llm.ts를 고칠 때 여기 current도 같이 고쳐야 비교가 의미 있다.
 const PRESETS = {
   before: {
@@ -40,25 +44,46 @@ const PRESETS = {
       "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).",
     params: { max_tokens: 900, frequency_penalty: 0.5, reasoning_effort: "low" },
   },
-  // 넘겨주지 않은 조항 번호를 지어내는 걸 막아본다.
-  // 260912 기준 남은 실패 3건 중 2건이 6.02⒜, 9.13처럼 있지도 않은 번호였다.
-  인용제한: {
-    label: "인용제한",
-    note: "목록 밖 번호 금지 (지시문만)",
+  // 조건을 흘리는 걸 막아본다.
+  //
+  // 260912 기준 모델 탓 실패 4건 중 3건이 "답은 맞는데 조건 하나를 빠뜨림"이다.
+  // 인필드 플라이는 '무사 또는 1사'를, 타임은 '볼 데드'를, 피치클락은
+  // '타석간 33초'를 흘렸다. 셋 다 근거 조항에 그대로 적혀 있던 내용이다.
+  // 짧게 쓰라는 지시에 맞추느라 요약하면서 잘라낸 것으로 보인다.
+  문장포함: {
+    label: "문장포함",
+    note: "핵심 문장은 그대로 옮겨 적게",
     tail:
-      "3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.\n" +
-      "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).\n" +
-      "인용은 위에 제시된 조항 번호 중에서만 골라라. 목록에 없는 번호는 절대 쓰지 마라.",
+      "질문의 핵심 단어가 들어간 조항 문장은 요약하지 말고 그대로 옮겨 적어라.\n" +
+      "그 문장에 있는 조건, 숫자, 예외를 하나도 빼지 마라.\n" +
+      "그런 다음 3~5문장으로 풀어서 설명하라. 표는 쓰지 말고 줄글로 쓴다.\n" +
+      "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).",
     params: { max_tokens: 900, frequency_penalty: 0.5, reasoning_effort: "low" },
   },
-  인용제한목록: {
-    label: "인용제한+목록",
-    note: "쓸 수 있는 번호를 따로 나열",
-    tail: (ids) =>
-      "3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.\n" +
-      "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).\n" +
-      `인용할 수 있는 번호는 이것뿐이다: ${ids.join(", ")}\n` +
-      "이 목록에 없는 번호는 절대 쓰지 마라.",
+  // lib/llm.ts에 실제로 들어간 방식. 질문 형태에 따라 지시를 나눈다.
+  형태별: {
+    label: "형태별",
+    note: "단어형에만 문장 그대로",
+    tail: (ids, question) =>
+      (ASKS_TERM.test(question) && !ASKS_CASE.test(question)
+        ? "질문의 핵심 단어가 들어간 조항 문장은 요약하지 말고 그대로 옮겨 적어라.\n" +
+          "그 문장에 있는 조건, 숫자, 예외를 하나도 빼지 마라.\n" +
+          "그런 다음 3~5문장으로 풀어서 설명하라. 표는 쓰지 말고 줄글로 쓴다.\n"
+        : "3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.\n") +
+      "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).",
+    params: { max_tokens: 900, frequency_penalty: 0.5, reasoning_effort: "low" },
+  },
+  // 위와 같되 "표는 쓰지 말고"를 뺀다.
+  // 피치클락 규정의 답은 하필 표로 되어 있어, 그 지시가 표 안의 숫자까지
+  // 버리게 만들었을 수 있다.
+  문장포함표허용: {
+    label: "문장포함+표허용",
+    note: "핵심 문장 그대로 + 표 금지 해제",
+    tail:
+      "질문의 핵심 단어가 들어간 조항 문장은 요약하지 말고 그대로 옮겨 적어라.\n" +
+      "그 문장에 있는 조건, 숫자, 예외를 하나도 빼지 마라.\n" +
+      "그런 다음 3~5문장으로 풀어서 설명하라.\n" +
+      "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).",
     params: { max_tokens: 900, frequency_penalty: 0.5, reasoning_effort: "low" },
   },
 };
@@ -272,7 +297,7 @@ function buildPrompt(question, results, tail) {
     .join("\n\n---\n\n");
 
   // 프리셋에 따라 넘긴 조항 번호를 지시문에 넣어야 할 때가 있다.
-  if (typeof tail === "function") tail = tail(shown.map((r) => r.id));
+  if (typeof tail === "function") tail = tail(shown.map((r) => r.id), question);
 
   return `아래는 KBO 공식 야구규칙과 KBO 리그 규정에서 검색으로 찾은 조항들이다.
 이 조항들만 근거로 질문에 답하라.
@@ -300,7 +325,7 @@ async function measure(prompt, params) {
   const stream = await client.chat.completions.create({
     model: MODEL,
     messages: [{ role: "user", content: prompt }],
-    temperature: 0.2,
+    temperature: 0,
     stream: true,
     stream_options: { include_usage: true },
     ...params,
