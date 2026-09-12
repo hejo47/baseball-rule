@@ -30,14 +30,31 @@ CHAPTERS = {
     9: "공식 기록원",
 }
 
+TOC_END_PAGE = 24       # 목차 끝 (본문 시작 직전)
+
 FOOTER = re.compile(r"^\s*[․·.]\s*\d+\s*[․·.]\s*$")
-# 조항 헤더는 '5.09 아웃' 처럼 번호 + 공백 + 짧은 한글 제목으로 끝나는 줄이다.
-# '5.09⒟ 참조)' 같은 본문 속 상호참조와 구분하기 위해 공백과 한글 시작을 요구한다.
-ARTICLE = re.compile(r"^\s{0,4}(\d{1,2}\.\d{2})\s+([가-힣][^\n]{0,28})\s*$")
+
+# 목차 줄: '9.13      와일드 피치· 패스트볼 ·············· 153'
+TOC = re.compile(r"^\s*(\d{1,2}\.\d{2})\s+(.+?)\s*[·․.]{4,}\s*\d+\s*$")
+
+# 본문에서 조항이 시작하는 줄: '9.13 와일드 피치(WILD PITCH 폭투 暴投)...'
+# 제목 모양을 추측하지 않는다. 목차에 있는 번호인지로만 판단하고,
+# 번호가 목차 순서대로 나오는지까지 확인해 본문 속 상호참조를 걸러낸다.
+#
+# 예전에는 제목이 '한글로 시작하고 29자 이내'여야 조항으로 인정했다.
+# 그 바람에 11개 조항이 통째로 사라졌다. 제목이 길거나(9.13 와일드 피치
+# ·패스트볼 42자), 숫자로 시작하거나(9.14 4구, 3.05 1루수 글러브),
+# 아예 제목이 없는(1.01~1.06) 조항들이다. 빠진 내용은 앞 조항에 들러붙어
+# '폭투' 규정이 '실책'이라는 제목을 달고 검색되고 있었다.
+ARTICLE_START = re.compile(r"^\s{0,4}(\d{1,2}\.\d{2})(?:\s+(.*))?$")
 
 # 1단계: ⒜⒝⒞  2단계: ⑴⑵⑶
+# 두 번째 값은 '첫 기호의 바로 앞' 코드다. 그래야 ⒜와 ⑴이 똑같이 1번이 된다.
+# 예전에는 ⒜ 쪽만 0x249C(=⒜ 자신)로 적혀 있어서 ⒜가 0번이 됐고,
+# 분할이 ⒝부터 시작해 ⒜ 항목이 11개 조항에서 통째로 도입부로 밀려났다.
+# ('6.02⒜ 보크'가 '6.02⒝'의 머리말로 250자만 잘려 들어가 있었다.)
 LEVELS = [
-    (re.compile(r"^\s{0,3}([⒜-⒵])\s*(.*)$"), 0x249C),
+    (re.compile(r"^\s{0,3}([⒜-⒵])\s*(.*)$"), 0x249B),
     (re.compile(r"^\s{0,3}([⑴-⒇])\s*(.*)$"), 0x2473),
 ]
 MAX_CHARS = 2500  # 이보다 긴 조각은 다음 단계로 더 쪼갠다
@@ -76,25 +93,61 @@ def squash(lines: list[str]) -> str:
 
 # ---------------------------------------------------------------- 파싱
 
-def parse_articles(text: str) -> list[dict]:
-    """본문을 조항(N.NN) 단위로 자른다."""
-    chunks, current = [], None
+def parse_toc(text: str) -> dict[str, str]:
+    """목차에서 조항 번호와 제목을 뽑는다. 어떤 번호가 조항인지의 정답지다."""
+    entries = {}
+    for line in text.split("\n"):
+        m = TOC.match(line)
+        if m:
+            entries.setdefault(m.group(1), re.sub(r"\s+", " ", m.group(2)).strip())
+    return entries
+
+
+def _is_title(toc_title: str, rest: str) -> bool:
+    """본문 헤더 줄의 뒷부분이 제목인지, 아니면 본문이 바로 시작한 것인지 본다.
+
+    본문 제목은 '와일드 피치(WILD PITCH 폭투 暴投)·패스트볼(PASSED BALL)'처럼
+    영문과 한자를 괄호로 달고 있어 목차 제목보다 길다. 괄호를 걷어내면 같아진다.
+    1.01~1.06처럼 제목 없이 본문이 바로 오는 조항은 같아지지 않는다.
+    """
+    if not rest:
+        return False
+    def bare(t):
+        return re.sub(r"[\s()（）]", "", re.sub(r"\([^)]*\)", "", t))
+    return bare(toc_title) == bare(rest)
+
+
+def parse_articles(text: str, toc: dict[str, str]) -> list[dict]:
+    """본문을 조항(N.NN) 단위로 자른다.
+
+    어떤 번호가 조항인지는 목차가 정한다. 제목 모양을 추측하지 않으므로
+    제목이 길든, 숫자로 시작하든, 아예 없든 상관이 없다.
+    본문 속 '5.09⒟ 참조' 같은 상호참조는 목차 순서를 거스르므로 걸러진다.
+    """
+    position = {number: i for i, number in enumerate(toc)}
+    chunks, current, last = [], None, -1
 
     for line in text.split("\n"):
-        m = ARTICLE.match(line)
-        if m:
+        m = ARTICLE_START.match(line)
+        number = m.group(1) if m else None
+
+        if number in position and position[number] > last:
+            last = position[number]
+            rest = (m.group(2) or "").strip()
+            titled = _is_title(toc[number], rest)
+            chapter = int(number.split(".")[0])
             if current:
                 chunks.append(current)
-            number, title = m.group(1), m.group(2).strip()
-            chapter = int(number.split(".")[0])
             current = {
                 "id": number,
-                "title": title,
+                "title": rest if titled else toc[number],
                 "chapter": f"{chapter}.00 {CHAPTERS.get(chapter, '')}",
                 "type": "규칙",
-                "lines": [],
+                # 제목이 없는 조항은 헤더 줄의 뒷부분이 곧 본문 첫 줄이다.
+                "lines": [] if titled else ([rest] if rest else []),
             }
             continue
+
         if current:
             current["lines"].append(line)
 
@@ -184,11 +237,23 @@ def parse_definitions(text: str) -> list[dict]:
 def main(src: str, dst: str) -> None:
     raw = open(src, encoding="utf-8").read()
 
+    toc = parse_toc("\n".join(raw.split("\f")[:TOC_END_PAGE]))
     body = "\n".join(clean_pages(raw, BODY_START_PAGE, BODY_END_PAGE))
     defs = "\n".join(clean_pages(raw, DEF_START_PAGE, DEF_END_PAGE))
 
+    parsed = parse_articles(body, toc)
+
+    # 목차에 있는 조항을 하나라도 놓치면 알아차릴 수 있게 확인한다.
+    # 예전 파서는 11개를 조용히 흘렸고, 그 내용이 앞 조항에 들러붙어
+    # 엉뚱한 제목을 달고 검색됐다.
+    missed = [n for n in toc if n not in {a["id"] for a in parsed}]
+    if missed:
+        print(f"경고: 목차에 있는데 본문에서 못 찾은 조항 {len(missed)}개")
+        for n in missed:
+            print(f"  {n} {toc[n]}")
+
     articles = []
-    for a in parse_articles(body):
+    for a in parsed:
         articles.extend(split_long(a))
 
     rules = articles + parse_definitions(defs)
@@ -201,6 +266,7 @@ def main(src: str, dst: str) -> None:
 
     articles = [r for r in rules if r["type"] == "규칙"]
     terms = [r for r in rules if r["type"] == "정의"]
+    print(f"목차 {len(toc)}개 중 {len(parsed)}개 확인 -> 조각 {len(articles)}개")
     print(f"조항 {len(articles)}개, 정의 {len(terms)}개 -> {dst}")
     print(f"평균 길이 {sum(r['chars'] for r in rules) // len(rules)}자, "
           f"최장 {max(r['chars'] for r in rules)}자")

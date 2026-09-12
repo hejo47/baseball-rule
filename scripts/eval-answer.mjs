@@ -40,6 +40,27 @@ const PRESETS = {
       "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).",
     params: { max_tokens: 900, frequency_penalty: 0.5, reasoning_effort: "low" },
   },
+  // 넘겨주지 않은 조항 번호를 지어내는 걸 막아본다.
+  // 260912 기준 남은 실패 3건 중 2건이 6.02⒜, 9.13처럼 있지도 않은 번호였다.
+  인용제한: {
+    label: "인용제한",
+    note: "목록 밖 번호 금지 (지시문만)",
+    tail:
+      "3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.\n" +
+      "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).\n" +
+      "인용은 위에 제시된 조항 번호 중에서만 골라라. 목록에 없는 번호는 절대 쓰지 마라.",
+    params: { max_tokens: 900, frequency_penalty: 0.5, reasoning_effort: "low" },
+  },
+  인용제한목록: {
+    label: "인용제한+목록",
+    note: "쓸 수 있는 번호를 따로 나열",
+    tail: (ids) =>
+      "3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.\n" +
+      "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).\n" +
+      `인용할 수 있는 번호는 이것뿐이다: ${ids.join(", ")}\n` +
+      "이 목록에 없는 번호는 절대 쓰지 마라.",
+    params: { max_tokens: 900, frequency_penalty: 0.5, reasoning_effort: "low" },
+  },
 };
 
 const args = process.argv.slice(2);
@@ -196,10 +217,13 @@ async function searchApi(message) {
 }
 
 function buildPrompt(question, results, tail) {
-  const context = results
-    .slice(0, CONTEXT_LIMIT)
+  const shown = results.slice(0, CONTEXT_LIMIT);
+  const context = shown
     .map((r) => `[${r.id}] ${r.title}\n${r.text}`)
     .join("\n\n---\n\n");
+
+  // 프리셋에 따라 넘긴 조항 번호를 지시문에 넣어야 할 때가 있다.
+  if (typeof tail === "function") tail = tail(shown.map((r) => r.id));
 
   return `아래는 KBO 공식 야구규칙에서 검색으로 찾은 조항들이다. 이 조항들만 근거로 질문에 답하라.
 조항에 없는 내용은 추측하지 말고 "규칙집에서 찾지 못했습니다"라고 답하라.

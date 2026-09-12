@@ -50,6 +50,15 @@ const EMBEDDING_WEIGHT = 0.5;
 // 그래서 코사인 유사도가 그냥 내적이 된다.
 const DOC_VECTORS: number[][] = vectorFile.vectors;
 
+// 규칙집만 바꾸고 벡터를 다시 안 만들면 순서가 어긋나 엉뚱한 조항이
+// 엉뚱한 점수를 받는다. 조용히 틀리느니 바로 알아차리게 한다.
+if (DOC_VECTORS.length !== DOCS.length) {
+  throw new Error(
+    `data/vectors.json이 ${DOC_VECTORS.length}개인데 data/rules.json은 ${DOCS.length}개입니다. ` +
+      `npm run build:vectors를 다시 돌리세요.`,
+  );
+}
+
 function normalize(text: string): string {
   return text.replace(/\s+/g, "").toLowerCase();
 }
