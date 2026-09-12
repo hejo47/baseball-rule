@@ -1,5 +1,7 @@
 import rules from "@/data/rules.json";
 import synonyms from "@/data/synonyms.json";
+import vectorFile from "@/data/vectors.json";
+import { embedQuery } from "@/lib/embedding";
 
 export interface RuleEntry {
   id: string;
@@ -25,10 +27,28 @@ interface Synonym {
 
 const SYNONYMS = synonyms as Synonym[];
 
-// 제목 쪽이 본문보다 훨씬 정확한 신호라 최종 점수에서 크게 반영한다.
-// 본문은 제목에 없는 단어를 보충하는 정도의 역할만 한다.
-const TITLE_WEIGHT = 0.85;
-const TEXT_WEIGHT = 0.15;
+// 제목 쪽이 본문보다 정확한 신호지만, 0.85까지 몰아주면 답이 본문에만 있는
+// 질문을 아예 못 찾는다. ("몸에 맞는 공"의 정답 5.06⒞는 제목이 "주루"라
+// 질문과 한 글자도 안 겹치고, 본문에만 그 문장이 있다.)
+const TITLE_WEIGHT = 0.55;
+const TEXT_WEIGHT = 0.45;
+
+// 화면과 채점에 넘길 최대 개수.
+//
+// 글자 검색만 쓰던 때는 점수가 0인 조항이 알아서 걸러져 보통 30~40개가
+// 남았다. 뜻 점수는 아무 조항에나 0보다 큰 값을 주기 때문에 그냥 두면
+// 251개가 전부 딸려와 응답이 400KB가 되고 화면에도 "검색된 조항 251개"가
+// 뜬다. AI는 어차피 상위 8개만 보고, 사람이 눈으로 훑는 것도 그쯤이다.
+export const RESULT_LIMIT = 30;
+
+// 글자 점수와 뜻 점수를 섞는 비율. 반반이 가장 좋았다.
+// 뜻만 쓰면 "낫아웃"이 20등까지 밀리고, 글자만 쓰면 "아웃이란 뭐야?"가
+// 23등으로 밀린다. 서로 다른 구멍이라 둘을 같이 써야 메워진다.
+const EMBEDDING_WEIGHT = 0.5;
+
+// 문서 벡터는 build-vectors.mjs가 길이를 1로 맞춰 저장했다.
+// 그래서 코사인 유사도가 그냥 내적이 된다.
+const DOC_VECTORS: number[][] = vectorFile.vectors;
 
 function normalize(text: string): string {
   return text.replace(/\s+/g, "").toLowerCase();
@@ -121,17 +141,21 @@ function cosineScores(space: VectorSpace, query: string): number[] {
 
 interface Index {
   titleSpace: VectorSpace;
+  englishSpace: VectorSpace;
   textSpace: VectorSpace;
 }
 
 let cached: Index | null = null;
 
+// 제목과 영문명을 "아웃 OUT"처럼 한 덩어리로 색인하면, 안 쓰는 쪽이 벡터
+// 길이만 늘려 점수를 깎아먹는다. 한글로 "아웃"을 물으면 제목이 "아웃"뿐인
+// 조항은 0.86을 받는데 "아웃 OUT"인 정의-54는 0.287까지 떨어졌다.
+// 따로 색인해 둘 중 높은 쪽을 쓰면 어느 쪽으로 물어도 손해가 없다.
 function getIndex(): Index {
   if (!cached) {
     cached = {
-      titleSpace: buildVectorSpace(
-        DOCS.map((doc) => `${doc.title} ${doc.english ?? ""}`),
-      ),
+      titleSpace: buildVectorSpace(DOCS.map((doc) => doc.title)),
+      englishSpace: buildVectorSpace(DOCS.map((doc) => doc.english ?? "")),
       textSpace: buildVectorSpace(DOCS.map((doc) => doc.text)),
     };
   }
@@ -179,38 +203,99 @@ function expandQuery(query: string): string | null {
   return added.length === 0 ? null : `${query} ${added.join(" ")}`;
 }
 
-// 제목 유사도와 본문 유사도를 따로 계산해 제목 쪽에 훨씬 큰 가중치로 합친다.
-function combinedScores(query: string): number[] {
-  const { titleSpace, textSpace } = getIndex();
+// 제목 유사도와 본문 유사도를 따로 계산해 제목 쪽에 더 큰 가중치로 합친다.
+// 제목 점수는 한글 제목과 영문명 중 높은 쪽을 쓴다.
+function lexicalScores(query: string): number[] {
+  const { titleSpace, englishSpace, textSpace } = getIndex();
   const titleScores = cosineScores(titleSpace, query);
+  const englishScores = cosineScores(englishSpace, query);
   const textScores = cosineScores(textSpace, query);
   return DOCS.map(
-    (_, i) => titleScores[i] * TITLE_WEIGHT + textScores[i] * TEXT_WEIGHT,
+    (_, i) =>
+      Math.max(titleScores[i], englishScores[i]) * TITLE_WEIGHT +
+      textScores[i] * TEXT_WEIGHT,
   );
 }
 
-// topK를 생략하면 점수가 0보다 큰 조항을 전부 반환한다.
-export function search(query: string, topK?: number): SearchResult[] {
-  const scores = combinedScores(query);
+/** 글자가 얼마나 겹치는지로만 매긴 점수. 사전 확장까지 마친 결과다. */
+function lexicalWithSynonyms(query: string): number[] {
+  const scores = lexicalScores(query);
 
   // 확장한 질문은 따로 채점해 더 높은 쪽을 쓴다. 원래 질문 뒤에 붙이면
   // 확장어(흔한 말이 섞이기 쉽다)가 원래 질문의 비중을 깎아, 이미 잘 찾던
   // 질문까지 밀려났다. ("주루방해" 6등 -> 16등)
   const expanded = expandQuery(query);
   if (expanded) {
-    const expandedScores = combinedScores(expanded);
+    const expandedScores = lexicalScores(expanded);
     for (let i = 0; i < scores.length; i++) {
       scores[i] = Math.max(scores[i], expandedScores[i]);
     }
   }
+  return scores;
+}
 
-  const scored = DOCS.map((entry, i) => ({ entry, score: scores[i] }));
+/** 질문 벡터와 각 조각 벡터의 코사인 유사도. 벡터가 이미 길이 1이라 내적이다. */
+function semanticScores(queryVector: number[]): number[] {
+  const norm = Math.sqrt(queryVector.reduce((sum, v) => sum + v * v, 0));
+  if (norm === 0) return DOC_VECTORS.map(() => 0);
+  const unit = queryVector.map((v) => v / norm);
 
-  const sorted = scored
+  return DOC_VECTORS.map((docVector) => {
+    let dot = 0;
+    for (let i = 0; i < unit.length; i++) dot += unit[i] * docVector[i];
+    return dot;
+  });
+}
+
+// 두 점수는 눈금이 다르다. 글자 점수는 0.05~0.87, 뜻 점수는 0.07~0.58로
+// 나온다. 그냥 더하면 글자 쪽이 일방적으로 이기므로 각자 그 질문에서의
+// 최댓값으로 나눠 0~1로 맞춘 뒤 섞는다.
+function normalized(scores: number[]): number[] {
+  const max = Math.max(...scores);
+  return max > 0 ? scores.map((s) => s / max) : scores;
+}
+
+function rank(scores: number[], topK?: number): SearchResult[] {
+  const sorted = DOCS.map((entry, i) => ({ entry, score: scores[i] }))
     .filter((s) => s.score > 0)
     .sort((a, b) => b.score - a.score);
 
   return (topK === undefined ? sorted : sorted.slice(0, topK)).map(
     ({ entry, score }) => ({ ...entry, score }),
   );
+}
+
+/**
+ * 글자 검색만으로 순위를 매긴다. 외부 호출이 없어 즉시 끝난다.
+ * 뜻 검색을 쓸 수 없을 때(키 없음, API 실패) 이걸로 답한다.
+ */
+export function searchByLetters(query: string, topK?: number): SearchResult[] {
+  return rank(lexicalWithSynonyms(query), topK);
+}
+
+/**
+ * 글자와 뜻을 같이 보고 순위를 매긴다.
+ *
+ * 질문을 벡터로 바꾸느라 API를 한 번 타므로 300ms 안팎이 더 걸린다.
+ * 실패하면 글자 검색 결과를 그대로 돌려준다. 느려지거나 덜 정확해질 뿐
+ * 검색이 죽지는 않는다.
+ *
+ * topK를 생략하면 점수가 0보다 큰 조항을 전부 반환한다.
+ */
+export async function search(
+  query: string,
+  topK?: number,
+): Promise<SearchResult[]> {
+  const letters = lexicalWithSynonyms(query);
+
+  const queryVector = await embedQuery(query);
+  if (!queryVector) return rank(letters, topK);
+
+  const meaning = normalized(semanticScores(queryVector));
+  const byLetters = normalized(letters);
+  const blended = byLetters.map(
+    (s, i) => s * (1 - EMBEDDING_WEIGHT) + meaning[i] * EMBEDDING_WEIGHT,
+  );
+
+  return rank(blended, topK);
 }

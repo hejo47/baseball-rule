@@ -4,9 +4,9 @@ import { AnswerError, openAnswerStream, readAnswerStream } from "@/lib/llm";
 // Vercel 무료 플랜의 기본 함수 실행 제한은 짧다. LLM 응답을 기다릴 수 있도록 늘린다.
 export const maxDuration = 60;
 
-// 검색 결과는 /api/search가 이미 즉시 돌려줬으므로, 여기서는 답변만 만든다.
-// 검색은 메모리 계산이라 다시 돌려도 부담이 없어 클라이언트가 조항을
-// 통째로 되돌려보내지 않아도 된다.
+// 검색 결과는 /api/search가 이미 돌려줬으므로, 여기서는 답변만 만든다.
+// 검색을 다시 돌리는 값은 질문 임베딩 한 번(300ms 안팎)이라, 클라이언트가
+// 조항을 통째로 되돌려보내는 것보다 싸고 단순하다.
 //
 // 답변은 완성될 때까지 기다리지 않고 생성되는 대로 흘려보낸다.
 // 화면에는 첫 글자가 뜨는 순간부터 글이 차오른다.
@@ -26,7 +26,7 @@ export async function POST(request: Request) {
   // 상태 코드를 붙일 수 있어서, 화면이 이유를 그대로 보여줄 수 있다.
   let answer;
   try {
-    answer = await openAnswerStream(message, search(message));
+    answer = await openAnswerStream(message, await search(message));
   } catch (err) {
     console.error("openAnswerStream failed:", err);
     const known = err instanceof AnswerError;
