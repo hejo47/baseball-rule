@@ -154,7 +154,18 @@ function parseCitations(text) {
 
 const REFUSAL = /찾지\s*못했|찾을\s*수\s*없|규칙집에\s*없/;
 
-const RULE_TEXT = Object.fromEntries(rules.map((r) => [r.id, `${r.title}\n${r.text}`]));
+/**
+ * 답을 못 하겠다고 물러선 답변인지 본다. **첫 문장만** 본다.
+ *
+ * 예전에는 답변 아무 데서나 찾으면 거부로 봤다. 그래서 제대로 답해놓고
+ * 끝에 "이외의 경우는 규칙집에서 찾지 못했습니다"를 덧붙인 답변까지
+ * 포기로 분류됐다. (`타임은 언제 선언할 수 있어?`)
+ * 진짜 거부는 첫 문장부터 못 찾았다고 말한다.
+ */
+function isRefusal(text) {
+  const first = text.trim().split(/(?<=[.!?다])\s+/)[0] ?? "";
+  return REFUSAL.test(first);
+}
 
 /** 띄어쓰기와 대소문자 차이를 지운다. "볼 데드"와 "볼데드"를 같게 본다. */
 const flat = (s) => String(s).replace(/\s+/g, "").toLowerCase();
@@ -176,7 +187,7 @@ const flat = (s) => String(s).replace(/\s+/g, "").toLowerCase();
  * 틀렸을 때 "검색 탓"과 "모델 탓"을 가르는 건 그대로 둔다. 다만 기준이
  * 나아졌다. 빠진 내용이 넘겨준 조항 안에 있었으면 모델 탓, 없었으면 검색 탓이다.
  */
-function grade({ must, text, contextIds }) {
+function grade({ expect = [], must, text, contextIds }) {
   const cited = parseCitations(text);
   const invented = cited.filter((c) => !RULE_IDS.some((id) => relates(c, id)));
   const outside = cited.filter(
@@ -190,7 +201,7 @@ function grade({ must, text, contextIds }) {
     return { ...base, verdict: "빈답변", correct: false, searchMissed: false };
   }
 
-  const refused = REFUSAL.test(text);
+  const refused = isRefusal(text);
 
   // 함정 문제: 채점할 내용이 없다. 못 찾았다고 답하는 게 정답이다.
   if (must.length === 0) {
@@ -203,7 +214,6 @@ function grade({ must, text, contextIds }) {
   }
 
   const said = flat(text);
-  const context = flat(contextIds.map((id) => RULE_TEXT[id] ?? "").join("\n"));
 
   const hits = [];
   const misses = [];
@@ -212,11 +222,19 @@ function grade({ must, text, contextIds }) {
     (found ? hits : misses).push(item);
   }
 
-  // 빠뜨린 내용이 넘겨준 조항 안에 있기는 했나.
-  // 하나도 없었으면 모델이 답할 방법이 없었으므로 검색을 고쳐야 한다.
-  const hadSource = (item) =>
-    item.any.some((phrase) => context.includes(flat(phrase)));
-  const searchMissed = misses.length > 0 && !misses.some(hadSource);
+  // 검색이 정답 조항을 넘겨주기는 했나.
+  //
+  // 예전에는 "빠뜨린 내용의 표현이 넘겨준 조항 본문에 있나"로 봤는데,
+  // "1루"나 "진루" 같은 흔한 말은 아무 조항에나 있어서 검색이 실패한
+  // 경우까지 모델 탓으로 넘어갔다. (`몸에 맞는 공`은 정답 5.06⒞가 9등이라
+  // 넘어가지도 않았는데 모델 탓으로 찍혔다)
+  //
+  // testset의 expect는 검색이 물어와야 할 조항이다. 답이 맞았는지는
+  // 내용(must)으로 보고, 탓을 가르는 데만 expect를 쓴다.
+  const gotSource =
+    expect.length === 0 ||
+    expect.some((id) => contextIds.some((c) => relates(c, id)));
+  const searchMissed = misses.length > 0 && !gotSource;
 
   let verdict;
   if (misses.length === 0) verdict = "정답";
@@ -328,7 +346,7 @@ if (REGRADE) {
       const run = row.runs[name];
       next.runs[name] = run?.error
         ? run
-        : { ...run, ...grade({ must: MUST[row.q] ?? [], text: run.text, contextIds: row.contextIds }) };
+        : { ...run, ...grade({ expect: row.expect ?? [], must: MUST[row.q] ?? [], text: run.text, contextIds: row.contextIds }) };
     }
     rows.push(next);
   }
@@ -342,7 +360,7 @@ for (const { q, expect, level, must = [] } of questions) {
     const { tail, params } = PRESETS[name];
     try {
       const run = await measure(buildPrompt(q, results, tail), params);
-      row.runs[name] = { ...run, ...grade({ must, text: run.text, contextIds }) };
+      row.runs[name] = { ...run, ...grade({ expect, must, text: run.text, contextIds }) };
     } catch (err) {
       row.runs[name] = { error: String(err.message).slice(0, 200) };
     }
