@@ -147,59 +147,83 @@ function parseCitations(text) {
 
 const REFUSAL = /찾지\s*못했|찾을\s*수\s*없|규칙집에\s*없/;
 
+const RULE_TEXT = Object.fromEntries(rules.map((r) => [r.id, `${r.title}\n${r.text}`]));
+
+/** 띄어쓰기와 대소문자 차이를 지운다. "볼 데드"와 "볼데드"를 같게 본다. */
+const flat = (s) => String(s).replace(/\s+/g, "").toLowerCase();
+
 /**
  * 답변 하나를 채점한다.
  *
- * 틀린 답을 "검색 탓"과 "모델 탓"으로 갈라놓는 게 핵심이다. 정답 조항을
- * 애초에 안 넘겨줬으면 검색을 고쳐야 하고, 넘겨줬는데도 안 썼으면 프롬프트나
- * 모델을 고쳐야 해서 할 일이 완전히 달라진다.
+ * 조항 번호를 맞혔는지가 아니라 **답에 들어가야 할 내용이 들어갔는지**를 본다.
+ *
+ * 예전에는 testset의 expect와 인용 번호를 대조했는데, 파서를 고쳐 조항이
+ * 제대로 쪼개지자 정답이 될 수 있는 조항이 여러 개가 됐다. 모델이 더 나은
+ * 조항을 골라도 오답이 되는 일이 생겨(세트 포지션의 정의-70은 "두 가지
+ * 정규투구자세 가운데 하나다"가 전부인데 모델은 실제 설명이 있는 5.07⒜⑵를
+ * 골랐다) 기준을 내용 쪽으로 옮겼다.
+ *
+ * 필요한 내용이 조항 하나에 다 없는 경우도 있다. "투수가 이물질을 바르면"은
+ * 금지 행위가 6.02⒞에, 벌칙(즉시 퇴장)이 6.02⒟에 나뉘어 있다.
+ *
+ * 틀렸을 때 "검색 탓"과 "모델 탓"을 가르는 건 그대로 둔다. 다만 기준이
+ * 나아졌다. 빠진 내용이 넘겨준 조항 안에 있었으면 모델 탓, 없었으면 검색 탓이다.
  */
-function grade({ expect, text, contextIds }) {
-  // 모델이 추론만 하다 끝나 본문을 한 글자도 안 뱉는 경우가 있다.
-  // 인용이 없다는 점에서는 오답과 같지만 고칠 곳이 달라 따로 센다.
-  if (!text.trim()) {
-    return { verdict: "빈답변", correct: false, cited: [], invented: [], outside: [], searchMissed: false };
-  }
-
+function grade({ must, text, contextIds }) {
   const cited = parseCitations(text);
-  const refused = REFUSAL.test(text);
-
-  // 지어낸 번호: 규칙집에 그런 조항이 아예 없다.
   const invented = cited.filter((c) => !RULE_IDS.some((id) => relates(c, id)));
-  // 넘겨주지 않은 조항을 끌어다 썼다. 규칙집엔 있지만 근거로 본 적은 없는 것.
   const outside = cited.filter(
     (c) => !invented.includes(c) && !contextIds.some((id) => relates(c, id)),
   );
+  // 필드 이름이 measure()의 total(걸린 밀리초)과 겹치면 시간이 덮인다.
+  const base = { cited, invented, outside, hits: [], misses: [], mustTotal: must.length };
 
-  // 함정 문제: 정답 조항이 없는 게 정답이다.
-  if (expect.length === 0) {
+  // 모델이 추론만 하다 끝나 본문을 한 글자도 안 뱉는 경우가 있다.
+  if (!text.trim()) {
+    return { ...base, verdict: "빈답변", correct: false, searchMissed: false };
+  }
+
+  const refused = REFUSAL.test(text);
+
+  // 함정 문제: 채점할 내용이 없다. 못 찾았다고 답하는 게 정답이다.
+  if (must.length === 0) {
     return {
+      ...base,
       verdict: refused ? "정답" : "지어냄",
       correct: refused,
-      cited,
-      invented,
-      outside,
       searchMissed: false,
     };
   }
 
-  const searchMissed = !expect.some((e) => contextIds.some((c) => relates(c, e)));
-  const exact = expect.some((e) => cited.some((c) => normId(c) === normId(e)));
-  const partial = !exact && expect.some((e) => cited.some((c) => relates(c, e)));
+  const said = flat(text);
+  const context = flat(contextIds.map((id) => RULE_TEXT[id] ?? "").join("\n"));
+
+  const hits = [];
+  const misses = [];
+  for (const item of must) {
+    const found = item.any.some((phrase) => said.includes(flat(phrase)));
+    (found ? hits : misses).push(item);
+  }
+
+  // 빠뜨린 내용이 넘겨준 조항 안에 있기는 했나.
+  // 하나도 없었으면 모델이 답할 방법이 없었으므로 검색을 고쳐야 한다.
+  const hadSource = (item) =>
+    item.any.some((phrase) => context.includes(flat(phrase)));
+  const searchMissed = misses.length > 0 && !misses.some(hadSource);
 
   let verdict;
-  if (exact) verdict = "정답";
-  else if (partial) verdict = "부분";       // 상위 번호만 적음 (5.05⑵ -> 5.05)
-  else if (searchMissed) verdict = "검색실패"; // 근거를 못 받았으니 모델 탓이 아니다
-  else if (refused) verdict = "포기";        // 근거를 받고도 못 찾았다고 답함
-  else verdict = "놓침";                     // 근거를 받고도 엉뚱한 조항을 인용
+  if (misses.length === 0) verdict = "정답";
+  else if (searchMissed) verdict = "검색실패";
+  else if (refused) verdict = "포기";
+  else if (hits.length >= must.length / 2) verdict = "일부";
+  else verdict = "놓침";
 
   return {
+    ...base,
     verdict,
-    correct: exact || partial,
-    cited,
-    invented,
-    outside,
+    correct: misses.length === 0,
+    hits: hits.map((i) => i.name),
+    misses: misses.map((i) => i.name),
     searchMissed,
   };
 }
@@ -279,6 +303,8 @@ async function measure(prompt, params) {
 }
 
 const rows = [];
+// 지난 측정을 다시 채점할 때도 채점 기준은 지금 testset에서 가져온다.
+const MUST = Object.fromEntries(testset.map((t) => [t.q, t.must ?? []]));
 
 if (REGRADE) {
   // 경로는 절대경로이거나 프로젝트 루트 기준 상대경로(results/...)로 받는다.
@@ -293,21 +319,21 @@ if (REGRADE) {
       const run = row.runs[name];
       next.runs[name] = run?.error
         ? run
-        : { ...run, ...grade({ expect: row.expect, text: run.text, contextIds: row.contextIds }) };
+        : { ...run, ...grade({ must: MUST[row.q] ?? [], text: run.text, contextIds: row.contextIds }) };
     }
     rows.push(next);
   }
 } else
-for (const { q, expect, level } of questions) {
+for (const { q, expect, level, must = [] } of questions) {
   const results = await searchApi(q);
   const contextIds = results.slice(0, CONTEXT_LIMIT).map((r) => r.id);
-  const row = { q, level, expect, contextIds, runs: {} };
+  const row = { q, level, expect, must: must.map((m) => m.name), contextIds, runs: {} };
 
   for (const name of RUN) {
     const { tail, params } = PRESETS[name];
     try {
       const run = await measure(buildPrompt(q, results, tail), params);
-      row.runs[name] = { ...run, ...grade({ expect, text: run.text, contextIds }) };
+      row.runs[name] = { ...run, ...grade({ must, text: run.text, contextIds }) };
     } catch (err) {
       row.runs[name] = { error: String(err.message).slice(0, 200) };
     }
@@ -327,13 +353,15 @@ const width = (s, n) => {
 };
 
 // 한 칸에 들어갈 요약. 판정을 앞에, 걸린 시간을 뒤에 적는다.
+// 판정과 '필요한 내용 중 몇 개를 말했는지'를 함께 보여준다.
 const cell = (r) => {
   if (!r) return "-";
   if (r.error) return "에러";
-  if (r.cut) return `20초+ ${r.verdict ?? ""}`.trim();
-  if (!r.chars) return `${(r.total / 1000).toFixed(1)}s 빈 답변`;
-  const flag = r.invented.length ? "+지어냄" : r.outside.length ? "+밖인용" : "";
-  return `${r.verdict}${flag} ${(r.total / 1000).toFixed(1)}s`;
+  if (!r.chars) return "빈 답변";
+  // 판정 · 필요한 내용 중 몇 개를 말했는지 · 걸린 시간
+  const score = r.mustTotal ? ` ${r.hits.length}/${r.mustTotal}` : "";
+  const flag = r.invented.length ? "+지어냄" : "";
+  return `${r.verdict}${score}${flag} ${(r.total / 1000).toFixed(1)}s`;
 };
 
 console.log(`대상: ${BASE} · 모델: ${MODEL} · ${questions.length}문항 · 조항 ${CONTEXT_LIMIT}개 · 대기 한계 ${PATIENCE_MS / 1000}초\n`);
@@ -355,11 +383,17 @@ for (const name of RUN) {
   const count = (v) => rs.filter((r) => r.verdict === v).length;
   const pct = (n) => `${n}/${rs.length} (${((n / (rs.length || 1)) * 100).toFixed(0)}%)`;
 
+  // 문항 단위(전부 말했나)와 항목 단위(70개 중 몇 개를 말했나)를 같이 본다.
+  // 문항 단위만 보면 4개 중 3개를 말한 답과 하나도 못 말한 답이 똑같이 오답이 된다.
+  const items = rs.reduce((a, r) => a + (r.mustTotal ?? 0), 0);
+  const itemHits = rs.reduce((a, r) => a + (r.hits?.length ?? 0), 0);
+
   const summary = {
     문항: rs.length,
-    맞힌_문항: rs.filter((r) => r.correct).length,
-    정답: count("정답"),
-    부분정답: count("부분"),
+    전부_말한_문항: rs.filter((r) => r.correct).length,
+    채점항목: items,
+    말한_항목: itemHits,
+    일부만_말함: count("일부"),
     놓침_모델탓: count("놓침"),
     포기_모델탓: count("포기"),
     검색실패_검색탓: count("검색실패"),
@@ -377,11 +411,11 @@ for (const name of RUN) {
 
   console.log(`\n[${PRESETS[name].label}] ${PRESETS[name].note}`);
   console.log(`  ── 정확도 ──`);
-  console.log(`  ${width("맞힘(정답+부분)", 26)}: ${pct(summary.맞힌_문항)}`);
-  console.log(`  ${width("  정답 조항 정확히 인용", 26)}: ${summary.정답}`);
-  console.log(`  ${width("  상위 번호만 인용", 26)}: ${summary.부분정답}`);
-  console.log(`  ${width("틀림 - 모델 탓", 26)}: ${summary.놓침_모델탓 + summary.포기_모델탓 + summary.지어냄_함정오답 + summary.빈답변}`);
-  console.log(`  ${width("  근거 받고도 엉뚱한 인용", 26)}: ${summary.놓침_모델탓}`);
+  console.log(`  ${width("필요한 내용을 전부 말함", 26)}: ${pct(summary.전부_말한_문항)}`);
+  console.log(`  ${width("항목 단위 적중", 26)}: ${itemHits}/${items} (${((itemHits / (items || 1)) * 100).toFixed(0)}%)`);
+  console.log(`  ${width("틀림 - 모델 탓", 26)}: ${summary.일부만_말함 + summary.놓침_모델탓 + summary.포기_모델탓 + summary.지어냄_함정오답 + summary.빈답변}`);
+  console.log(`  ${width("  절반 이상은 말함", 26)}: ${summary.일부만_말함}`);
+  console.log(`  ${width("  절반도 못 말함", 26)}: ${summary.놓침_모델탓}`);
   console.log(`  ${width("  근거 받고도 못 찾겠다 함", 26)}: ${summary.포기_모델탓}`);
   console.log(`  ${width("  함정에 답을 지어냄", 26)}: ${summary.지어냄_함정오답}`);
   console.log(`  ${width("  답변이 비어 있음", 26)}: ${summary.빈답변}`);
