@@ -96,9 +96,13 @@ const MODEL = process.env.NVIDIA_MODEL ?? "openai/gpt-oss-20b";
 const testset = JSON.parse(
   await readFile(new URL("../data/testset.json", import.meta.url), "utf8"),
 );
-const rules = JSON.parse(
-  await readFile(new URL("../data/rules.json", import.meta.url), "utf8"),
-);
+// lib/search.ts의 DOCS와 같아야 한다. 리그 규정을 빼먹으면 그 조항들을
+// 전부 "없는 번호"로 세고, 본문 조회도 빈 문자열이 돼 검색 탓/모델 탓
+// 판정까지 틀어진다.
+const rules = [
+  ...JSON.parse(await readFile(new URL("../data/rules.json", import.meta.url), "utf8")),
+  ...JSON.parse(await readFile(new URL("../data/league.json", import.meta.url), "utf8")),
+];
 const questions = testset.slice(0, LIMIT);
 
 // ------------------------------------------------------------- 인용 채점
@@ -138,7 +142,10 @@ function parseCitations(text) {
   for (const [, raw] of text.matchAll(/\[([^\]\n]{1,80})\]/g)) {
     const inner = raw.replace(DASHES, "-");
     for (const piece of inner.split(/[,;·]|\s{2,}/)) {
-      const m = piece.match(/(정의\s*-\s*\d{1,3}|\d{1,2}\.\d{2}[⒜-⒵⑴-⒇]*)/);
+      // 야구규칙(5.05⒜, 정의-40)과 리그 규정(리그-제28조-4) 두 가지 꼴이 있다.
+      const m = piece.match(
+        /(리그-[가-힣A-Za-z0-9()\-①-⑳]+|정의\s*-\s*\d{1,3}|\d{1,2}\.\d{2}[⒜-⒵⑴-⒇]*)/,
+      );
       if (m) out.push(normId(m[1]));
     }
   }
@@ -243,14 +250,16 @@ async function searchApi(message) {
 function buildPrompt(question, results, tail) {
   const shown = results.slice(0, CONTEXT_LIMIT);
   const context = shown
-    .map((r) => `[${r.id}] ${r.title}\n${r.text}`)
+    .map((r) => `[${r.id}] ${r.title} (${r.source})\n${r.text}`)
     .join("\n\n---\n\n");
 
   // 프리셋에 따라 넘긴 조항 번호를 지시문에 넣어야 할 때가 있다.
   if (typeof tail === "function") tail = tail(shown.map((r) => r.id));
 
-  return `아래는 KBO 공식 야구규칙에서 검색으로 찾은 조항들이다. 이 조항들만 근거로 질문에 답하라.
+  return `아래는 KBO 공식 야구규칙과 KBO 리그 규정에서 검색으로 찾은 조항들이다.
+이 조항들만 근거로 질문에 답하라.
 조항에 없는 내용은 추측하지 말고 "규칙집에서 찾지 못했습니다"라고 답하라.
+근거가 어느 문서에서 왔는지 답변에 밝혀라. 야구규칙과 리그 규정은 다른 문서다.
 ${tail}
 
 # 검색된 조항

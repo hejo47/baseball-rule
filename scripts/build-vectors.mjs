@@ -34,9 +34,12 @@ if (!process.env.NVIDIA_API_KEY) {
   process.exit(1);
 }
 
-const docs = JSON.parse(
-  await readFile(new URL("../data/rules.json", import.meta.url), "utf8"),
-);
+// lib/search.ts의 DOCS와 같은 순서여야 한다. 어긋나면 조항과 벡터가
+// 엇갈려 엉뚱한 점수가 나온다. (search.ts가 개수를 확인해 막고 있다)
+const docs = [
+  ...JSON.parse(await readFile(new URL("../data/rules.json", import.meta.url), "utf8")),
+  ...JSON.parse(await readFile(new URL("../data/league.json", import.meta.url), "utf8")),
+];
 
 /** 무료 API가 간헐적으로 502를 낸다. 몇 번 쉬었다 다시 걸어본다. */
 async function embed(input, inputType, tries = 4) {

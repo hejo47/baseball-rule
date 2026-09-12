@@ -143,6 +143,7 @@ def parse_articles(text: str, toc: dict[str, str]) -> list[dict]:
                 "title": rest if titled else toc[number],
                 "chapter": f"{chapter}.00 {CHAPTERS.get(chapter, '')}",
                 "type": "규칙",
+                "source": "KBO 공식 야구규칙",
                 # 제목이 없는 조항은 헤더 줄의 뒷부분이 곧 본문 첫 줄이다.
                 "lines": [] if titled else ([rest] if rest else []),
             }
@@ -218,6 +219,7 @@ def parse_definitions(text: str) -> list[dict]:
                 "english": english,
                 "chapter": "용어의 정의",
                 "type": "정의",
+                "source": "KBO 공식 야구규칙",
                 "lines": [],
             }
             continue

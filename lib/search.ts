@@ -1,4 +1,5 @@
 import rules from "@/data/rules.json";
+import league from "@/data/league.json";
 import synonyms from "@/data/synonyms.json";
 import vectorFile from "@/data/vectors.json";
 import { embedQuery } from "@/lib/embedding";
@@ -7,7 +8,10 @@ export interface RuleEntry {
   id: string;
   title: string;
   chapter: string;
+  /** "규칙" | "정의" | "리그규정" */
   type: string;
+  /** 어느 문서에서 왔는지. 답변에서 근거 문서를 구분해 보여줄 때 쓴다. */
+  source: string;
   text: string;
   chars: number;
   english?: string;
@@ -17,7 +21,15 @@ export interface SearchResult extends RuleEntry {
   score: number;
 }
 
-const DOCS = rules as RuleEntry[];
+// 야구규칙과 리그 규정을 한 묶음으로 검색한다.
+//
+// 두 문서는 다루는 범위가 겹치지 않는다. 야구규칙에는 비디오 판독, 피치클락,
+// 엔트리 같은 운영 규정이 아예 없어서 예전에는 "규칙집에서 찾지 못했습니다"로
+// 답할 수밖에 없었다.
+//
+// data/vectors.json이 이 순서대로 만들어져 있다. 순서를 바꾸면
+// scripts/build-vectors.mjs도 같이 바꾸고 벡터를 다시 만들어야 한다.
+const DOCS = [...rules, ...league] as RuleEntry[];
 
 interface Synonym {
   words: string[];
@@ -162,6 +174,7 @@ let cached: Index | null = null;
 // 따로 색인해 둘 중 높은 쪽을 쓰면 어느 쪽으로 물어도 손해가 없다.
 function getIndex(): Index {
   if (!cached) {
+    warnDeadSynonyms();
     cached = {
       titleSpace: buildVectorSpace(DOCS.map((doc) => doc.title)),
       englishSpace: buildVectorSpace(DOCS.map((doc) => doc.english ?? "")),
@@ -196,6 +209,24 @@ function isRare(word: string): boolean {
     }
   }
   return (wordFrequency.get(normalize(word)) ?? 0) <= RARE_MAX_DOCS;
+}
+
+/**
+ * 사전 항목이 조용히 꺼지지 않았는지 확인한다.
+ *
+ * 확장은 '규칙집이 거의 쓰지 않는 말'에만 걸린다. 그래서 문서를 새로 넣으면
+ * 그 말이 흔해져 항목이 저절로 멈출 수 있다. 실제로 리그 규정을 넣자
+ * "몸에 맞는 공"이 2개 조항에서 나오게 돼 경계선(RARE_MAX_DOCS)에 걸렸다.
+ * 하나만 더 늘면 검색이 조용히 나빠지므로 로그로 알린다.
+ */
+function warnDeadSynonyms(): void {
+  for (const entry of SYNONYMS) {
+    if (entry.words.some(isRare)) continue;
+    console.warn(
+      `사전 항목이 동작하지 않습니다: ${entry.words.join(", ")} — ` +
+        `규칙집에 너무 흔해져 확장이 걸리지 않습니다. data/synonyms.json을 확인하세요.`,
+    );
+  }
 }
 
 // 사람들이 쓰는 말과 규칙집의 말이 다르면 글자가 겹치지 않아 아예 못 찾는다.

@@ -27,11 +27,13 @@ function getClient(): OpenAI | null {
 function buildPrompt(question: string, results: SearchResult[]): string {
   const context = results
     .slice(0, CONTEXT_LIMIT)
-    .map((r) => `[${r.id}] ${r.title}\n${r.text}`)
+    .map((r) => `[${r.id}] ${r.title} (${r.source})\n${r.text}`)
     .join("\n\n---\n\n");
 
-  return `아래는 KBO 공식 야구규칙에서 검색으로 찾은 조항들이다. 이 조항들만 근거로 질문에 답하라.
+  return `아래는 KBO 공식 야구규칙과 KBO 리그 규정에서 검색으로 찾은 조항들이다.
+이 조항들만 근거로 질문에 답하라.
 조항에 없는 내용은 추측하지 말고 "규칙집에서 찾지 못했습니다"라고 답하라.
+근거가 어느 문서에서 왔는지 답변에 밝혀라. 야구규칙과 리그 규정은 다른 문서다.
 3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.
 답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).
 
