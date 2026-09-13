@@ -309,7 +309,10 @@ export default function Home() {
                   <p className="mt-1 text-xs text-zinc-500">
                     {rule.source} · {rule.chapter}
                   </p>
-                  <p className="mt-2 max-h-72 overflow-y-auto text-sm whitespace-pre-line text-zinc-700 dark:text-zinc-300">
+                  {/* 전문을 그대로 보여준다. 높이를 제한하고 안쪽에 스크롤을
+                      두면 잘린 줄 모르고 지나친다. 조항 하나가 1,400자면
+                      920px인데 288px만 보이고 있었다. */}
+                  <p className="mt-2 text-sm whitespace-pre-line text-zinc-700 dark:text-zinc-300">
                     {rule.text}
                   </p>
                 </div>
