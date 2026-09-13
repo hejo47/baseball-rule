@@ -210,12 +210,16 @@ export default function Home() {
       }
       text += decoder.decode();
       patch(id, { answer: text.trim() || null, answering: false });
+      // 모델이 두 번 다 아무것도 내놓지 못하면 빈 채로 끝난다.
+      // 그때는 검색된 조항이라도 바로 보이게 펼쳐둔다.
+      if (!text.trim()) setOpenRules(id);
     } catch (err) {
       patch(id, {
         answer: null,
         answerError: err instanceof Error ? err.message : "답변 생성 실패",
         answering: false,
       });
+      setOpenRules(id);
     }
   }
 

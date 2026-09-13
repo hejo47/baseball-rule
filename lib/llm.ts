@@ -156,6 +156,15 @@ export async function openAnswerStream(question: string, results: SearchResult[]
 /**
  * 열어둔 스트림에서 답변을 조각조각 흘려보낸다.
  *
+ * 모델이 속으로 생각만 하다 한 글자도 안 뱉는 일이 있다(측정 476회 중 15회).
+ * 예전에는 그때 추론 과정이라도 보여줬는데, 그 내용이 영어 독백이라
+ * 화면에 이런 게 떴다.
+ *
+ *   We need to answer: "낫아웃이 성립하는 경우는?" Using only the provided...
+ *
+ * 사용자에게는 아무 쓸모가 없고 고장난 것처럼 보인다. 이제 내보내지 않고
+ * 서버 로그에만 남긴다. 빈 스트림을 받은 라우트가 다시 시도한다.
+ *
  * 답변 지연의 대부분은 모델이 답을 쓰기 전에 하는 "추론"이었다.
  * (reasoning_effort 기본값에서는 첫 글자까지 25~45초, 전체 45~140초)
  * reasoning_effort를 low로 낮추고 답변 길이를 제한해 전체 7초 안팎으로,
@@ -185,6 +194,10 @@ export async function* readAnswerStream(
     }
   }
 
-  // content가 끝까지 비면 추론 과정이라도 보여준다.
-  if (!sawContent && reasoning.trim()) yield reasoning.trim();
+  if (!sawContent) {
+    console.error(
+      "모델이 답변 본문을 내놓지 않았습니다. 추론 내용: " +
+        (reasoning.trim().slice(0, 200) || "(없음)"),
+    );
+  }
 }
