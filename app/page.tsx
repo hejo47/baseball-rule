@@ -1,27 +1,59 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { SearchResult } from "@/lib/search";
 
 // 목록에서 조항을 이만큼만 보여주고, 나머지는 "전체 보기"로 펼친다.
 const PREVIEW_CHARS = 300;
 
+/** 질문 하나와 그에 딸린 결과. 물어볼 때마다 하나씩 쌓인다. */
+interface Turn {
+  id: number;
+  question: string;
+  results: SearchResult[] | null;
+  answer: string | null;
+  searchError: string | null;
+  answerError: string | null;
+  searching: boolean;
+  answering: boolean;
+}
+
 export default function Home() {
   const [message, setMessage] = useState("");
-  const [results, setResults] = useState<SearchResult[] | null>(null);
-  const [answer, setAnswer] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [answerLoading, setAnswerLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // AI 답변만 실패했을 때 그 이유 (검색 결과는 그대로 보여준다)
-  const [answerError, setAnswerError] = useState<string | null>(null);
-  // 길게 잘린 조항 중 사용자가 펼쳐본 것들의 id
+  const [turns, setTurns] = useState<Turn[]>([]);
+  // 조항 목록은 한 번에 한 질문 것만 펼친다. 한 질문에 30개씩 나와서
+  // 다 펼쳐두면 지난 질문을 찾아보기가 어렵다.
+  const [openRules, setOpenRules] = useState<number | null>(null);
+  // 길게 잘린 조항 중 펼쳐본 것들. 같은 조항이 여러 질문에 나올 수 있어
+  // 질문 id까지 붙여서 구분한다.
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
-  function toggleExpanded(id: string) {
+  const last = turns[turns.length - 1];
+  const busy = Boolean(last && (last.searching || last.answering));
+
+  // 새 글이 붙으면 따라 내려간다. 단, 지난 질문을 읽으려고 위로 올려둔
+  // 상태라면 끌어내리지 않는다.
+  const stick = useRef(true);
+  useEffect(() => {
+    const onScroll = () => {
+      const bottom = document.body.scrollHeight - window.innerHeight;
+      stick.current = window.scrollY >= bottom - 80;
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+  useEffect(() => {
+    if (stick.current) window.scrollTo({ top: document.body.scrollHeight });
+  }, [turns]);
+
+  function patch(id: number, next: Partial<Turn>) {
+    setTurns((ts) => ts.map((t) => (t.id === id ? { ...t, ...next } : t)));
+  }
+
+  function toggleExpanded(key: string) {
     setExpanded((prev) => {
       const next = new Set(prev);
-      if (!next.delete(id)) next.add(id);
+      if (!next.delete(key)) next.add(key);
       return next;
     });
   }
@@ -29,14 +61,25 @@ export default function Home() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const question = message.trim();
-    if (!question) return;
+    if (!question || busy) return;
 
-    setLoading(true);
-    setError(null);
-    setResults(null);
-    setAnswer(null);
-    setAnswerError(null);
-    setExpanded(new Set());
+    const id = Date.now();
+    setTurns((ts) => [
+      ...ts,
+      {
+        id,
+        question,
+        results: null,
+        answer: null,
+        searchError: null,
+        answerError: null,
+        searching: true,
+        answering: false,
+      },
+    ]);
+    setOpenRules(id);
+    setMessage("");
+    stick.current = true;
 
     // 검색과 AI 답변을 동시에 요청한다. 답변 쪽이 훨씬 오래 걸리므로
     // 검색이 끝난 뒤에 시작하면 그만큼 손해다.
@@ -58,16 +101,17 @@ export default function Home() {
       const res = await searchPromise;
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "검색 실패");
-      setResults(data.results);
+      patch(id, { results: data.results, searching: false });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "알 수 없는 오류");
-      setLoading(false);
+      patch(id, {
+        searchError: err instanceof Error ? err.message : "알 수 없는 오류",
+        searching: false,
+      });
       return;
     }
-    setLoading(false);
 
     // 2단계: AI 답변은 다 쓰일 때까지 기다리지 않고, 오는 대로 이어 붙인다.
-    setAnswerLoading(true);
+    patch(id, { answering: true });
     try {
       const res = await answerPromise;
       if (!res.ok) {
@@ -85,31 +129,143 @@ export default function Home() {
         const { done, value } = await reader.read();
         if (done) break;
         text += decoder.decode(value, { stream: true });
-        setAnswer(text);
+        patch(id, { answer: text });
       }
       text += decoder.decode();
-      setAnswer(text.trim() || null);
+      patch(id, { answer: text.trim() || null, answering: false });
     } catch (err) {
-      setAnswer(null);
-      setAnswerError(err instanceof Error ? err.message : "답변 생성 실패");
-    } finally {
-      setAnswerLoading(false);
+      patch(id, {
+        answer: null,
+        answerError: err instanceof Error ? err.message : "답변 생성 실패",
+        answering: false,
+      });
     }
   }
 
   return (
-    <div className="flex flex-col flex-1 items-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex w-full max-w-2xl flex-col gap-6 px-6 py-16">
-        <div>
-          <h1 className="text-2xl font-semibold text-black dark:text-zinc-50">
+    <div className="flex flex-1 flex-col bg-zinc-50 font-sans dark:bg-black">
+      <header className="sticky top-0 z-10 border-b border-zinc-200 bg-zinc-50/90 backdrop-blur dark:border-zinc-800 dark:bg-black/90">
+        <div className="mx-auto w-full max-w-2xl px-6 py-4">
+          <h1 className="text-lg font-semibold text-black dark:text-zinc-50">
             KBO 규칙 검색 테스트
           </h1>
-          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-            규칙집 조항을 코사인 유사도 순으로 점수가 0보다 큰 것 전부 보여줍니다.
+          <p className="mt-0.5 text-xs text-zinc-600 dark:text-zinc-400">
+            KBO 공식 야구규칙과 KBO 리그 규정에서 찾아 답합니다.
           </p>
         </div>
+      </header>
 
-        <form onSubmit={handleSubmit} className="flex gap-2">
+      <main className="mx-auto w-full max-w-2xl flex-1 px-6 pt-6 pb-4">
+        {turns.length === 0 && (
+          <p className="py-16 text-center text-sm text-zinc-500">
+            궁금한 규칙을 물어보세요. 예: 인필드 플라이 조건은?
+          </p>
+        )}
+
+        <div className="flex flex-col gap-8">
+          {turns.map((turn) => (
+            <section key={turn.id} className="flex flex-col gap-3">
+              {/* 질문 */}
+              <div className="flex justify-end">
+                <p className="max-w-[85%] rounded-2xl rounded-br-sm bg-black px-4 py-2 text-sm text-white dark:bg-white dark:text-black">
+                  {turn.question}
+                </p>
+              </div>
+
+              {turn.searchError && (
+                <p className="text-sm text-red-600">{turn.searchError}</p>
+              )}
+
+              {turn.answering && !turn.answer && (
+                <div className="flex items-center gap-2 text-sm text-zinc-500">
+                  <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent" />
+                  AI가 조항을 읽고 답변을 정리하는 중…
+                </div>
+              )}
+
+              {turn.answer && (
+                <div className="rounded-lg border border-zinc-300 bg-white p-4 text-sm whitespace-pre-line text-black dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50">
+                  {turn.answer}
+                </div>
+              )}
+
+              {turn.results && !turn.answer && !turn.answering && (
+                <p className="text-xs text-zinc-500">
+                  {turn.answerError
+                    ? `AI 답변 실패: ${turn.answerError} 검색된 조항만 보여줍니다.`
+                    : "(AI 답변을 만들지 못해 검색된 조항만 보여줍니다.)"}
+                </p>
+              )}
+
+              {turn.results && (
+                <details className="text-sm" open={openRules === turn.id}>
+                  <summary
+                    className="cursor-pointer text-zinc-500 select-none"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      setOpenRules(openRules === turn.id ? null : turn.id);
+                    }}
+                  >
+                    검색된 조항 {turn.results.length}개
+                  </summary>
+                  <ul className="mt-3 flex flex-col gap-3">
+                    {turn.results.length === 0 && (
+                      <li className="text-sm text-zinc-500">
+                        일치하는 조항을 찾지 못했습니다.
+                      </li>
+                    )}
+                    {turn.results.map((r) => {
+                      const key = `${turn.id}:${r.id}`;
+                      const isLong = r.text.length > PREVIEW_CHARS;
+                      const isOpen = expanded.has(key);
+                      return (
+                        <li
+                          key={key}
+                          className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
+                        >
+                          <div className="flex items-baseline justify-between gap-2">
+                            <span className="font-medium text-black dark:text-zinc-50">
+                              {r.id} {r.title}
+                            </span>
+                            <span className="shrink-0 text-xs text-zinc-500">
+                              score {r.score.toFixed(3)}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-xs text-zinc-500">
+                            {r.source} · {r.chapter}
+                          </p>
+                          <p className="mt-2 text-sm whitespace-pre-line text-zinc-700 dark:text-zinc-300">
+                            {isLong && !isOpen
+                              ? r.text.slice(0, PREVIEW_CHARS) + "…"
+                              : r.text}
+                          </p>
+                          {isLong && (
+                            <button
+                              type="button"
+                              onClick={() => toggleExpanded(key)}
+                              className="mt-2 text-xs text-zinc-500 underline underline-offset-2 hover:text-black dark:hover:text-zinc-50"
+                            >
+                              {isOpen
+                                ? "접기"
+                                : `전체 보기 (${r.text.length.toLocaleString()}자)`}
+                            </button>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </details>
+              )}
+            </section>
+          ))}
+        </div>
+      </main>
+
+      <div className="sticky bottom-0 border-t border-zinc-200 bg-zinc-50/90 backdrop-blur dark:border-zinc-800 dark:bg-black/90">
+        <form
+          onSubmit={handleSubmit}
+          className="mx-auto flex w-full max-w-2xl gap-2 px-6 py-4"
+        >
           <input
             type="text"
             value={message}
@@ -119,89 +275,13 @@ export default function Home() {
           />
           <button
             type="submit"
-            disabled={loading}
+            disabled={busy}
             className="rounded-lg bg-black px-5 py-2 font-medium text-white disabled:opacity-50 dark:bg-white dark:text-black"
           >
-            {loading ? "검색 중…" : "검색"}
+            {busy ? "답변 중…" : "검색"}
           </button>
         </form>
-
-        {error && <p className="text-sm text-red-600">{error}</p>}
-
-        {answerLoading && !answer && (
-          <div className="flex items-center gap-2 rounded-lg border border-zinc-300 bg-white p-4 text-sm text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900">
-            <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent" />
-            AI가 조항을 읽고 답변을 정리하는 중…
-          </div>
-        )}
-
-        {results && !answer && !answerLoading && (
-          <p className="text-xs text-zinc-500">
-            {answerError
-              ? `AI 답변 실패: ${answerError} 검색된 조항만 보여줍니다.`
-              : "(AI 답변을 만들지 못해 검색된 조항만 보여줍니다.)"}
-          </p>
-        )}
-
-        {answer && (
-          <div className="rounded-lg border border-zinc-300 bg-white p-4 whitespace-pre-line text-sm text-black dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50">
-            {answer}
-          </div>
-        )}
-
-        {results && (
-          <details className="text-sm" open>
-            <summary className="cursor-pointer text-zinc-500">
-              검색된 조항 {results.length}개
-            </summary>
-            <ul className="mt-3 flex flex-col gap-3">
-            {results.length === 0 && (
-              <li className="text-sm text-zinc-500">
-                일치하는 조항을 찾지 못했습니다.
-              </li>
-            )}
-            {results.map((r) => {
-              const isLong = r.text.length > PREVIEW_CHARS;
-              const isOpen = expanded.has(r.id);
-              return (
-                <li
-                  key={r.id}
-                  className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
-                >
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="font-medium text-black dark:text-zinc-50">
-                      {r.id} {r.title}
-                    </span>
-                    <span className="shrink-0 text-xs text-zinc-500">
-                      score {r.score.toFixed(3)}
-                    </span>
-                  </div>
-                  <p className="mt-1 text-xs text-zinc-500">
-                    {r.chapter} · {r.type}
-                  </p>
-                  <p className="mt-2 whitespace-pre-line text-sm text-zinc-700 dark:text-zinc-300">
-                    {isLong && !isOpen
-                      ? r.text.slice(0, PREVIEW_CHARS) + "…"
-                      : r.text}
-                  </p>
-                  {isLong && (
-                    <button
-                      type="button"
-                      onClick={() => toggleExpanded(r.id)}
-                      className="mt-2 text-xs text-zinc-500 underline underline-offset-2 hover:text-black dark:hover:text-zinc-50"
-                    >
-                      {isOpen
-                        ? "접기"
-                        : `전체 보기 (${r.text.length.toLocaleString()}자)`}
-                    </button>
-                  )}
-                </li>
-              );
-            })}
-            </ul>
-          </details>
-        )}
-      </main>
+      </div>
     </div>
   );
 }
