@@ -6,6 +6,52 @@ import type { SearchResult } from "@/lib/search";
 // 목록에서 조항을 이만큼만 보여주고, 나머지는 "전체 보기"로 펼친다.
 const PREVIEW_CHARS = 300;
 
+// 모델이 "정의-40"을 "정의‑40"(유니코드 하이픈)으로 적는 일이 잦다.
+const DASHES = /[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g;
+// 답변 끝에 붙는 대괄호 표기. [주1]이나 [규칙집에서 찾지 못했습니다]처럼
+// 조항 번호가 아닌 것도 들어오므로 안쪽을 한 번 더 걸러낸다.
+const BRACKET = /\[([^\]\n]{1,80})\]/g;
+const RULE_ID = /(리그-[가-힣A-Za-z0-9()\-①-⑳]+|정의-\d{1,3}|\d{1,2}\.\d{2}[⒜-⒵⑴-⒇]*)/;
+
+const flatId = (s: string) => s.replace(DASHES, "-").replace(/\s+/g, "");
+
+/**
+ * 답변이 인용한 번호에 맞는 조항을 찾는다.
+ *
+ * 모델은 우리가 쪼갠 단위보다 깊게(5.06⒞⑴) 적기도 하고 얕게(5.06) 적기도
+ * 한다. 정확히 같은 것이 없으면 한쪽이 다른 쪽으로 시작하는 것 중 가장
+ * 구체적인 조항을 고른다.
+ */
+function findRule(cited: string, results: SearchResult[]): SearchResult | null {
+  const id = flatId(cited);
+  let best: SearchResult | null = null;
+  for (const r of results) {
+    const rid = flatId(r.id);
+    if (rid === id) return r;
+    if (id.startsWith(rid) || rid.startsWith(id)) {
+      if (!best || r.id.length > best.id.length) best = r;
+    }
+  }
+  return best;
+}
+
+/** 답변 글을 조각으로 나눈다. 인용 번호는 눌러볼 수 있는 조각이 된다. */
+function splitAnswer(text: string, results: SearchResult[]) {
+  const parts: ({ text: string } | { cited: string; rule: SearchResult })[] = [];
+  let at = 0;
+  for (const m of text.matchAll(BRACKET)) {
+    const inner = m[1].replace(DASHES, "-");
+    const found = inner.match(RULE_ID);
+    const rule = found ? findRule(found[1], results) : null;
+    if (!rule) continue;
+    if (m.index! > at) parts.push({ text: text.slice(at, m.index) });
+    parts.push({ cited: m[0], rule });
+    at = m.index! + m[0].length;
+  }
+  if (at < text.length) parts.push({ text: text.slice(at) });
+  return parts;
+}
+
 /** 질문 하나와 그에 딸린 결과. 물어볼 때마다 하나씩 쌓인다. */
 interface Turn {
   id: number;
@@ -27,6 +73,11 @@ export default function Home() {
   // 길게 잘린 조항 중 펼쳐본 것들. 같은 조항이 여러 질문에 나올 수 있어
   // 질문 id까지 붙여서 구분한다.
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // 답변 속 인용 번호를 눌러 고정해둔 것들. 마우스를 올리면 잠깐 보이고,
+  // 누르면 치울 때까지 남는다. 손가락으로 쓰는 화면에는 올리기가 없어서
+  // 누르기가 본 동작이다.
+  const [pinnedCites, setPinnedCites] = useState<Set<string>>(new Set());
+  const [hoverCite, setHoverCite] = useState<string | null>(null);
 
   const last = turns[turns.length - 1];
   const busy = Boolean(last && (last.searching || last.answering));
@@ -48,6 +99,14 @@ export default function Home() {
 
   function patch(id: number, next: Partial<Turn>) {
     setTurns((ts) => ts.map((t) => (t.id === id ? { ...t, ...next } : t)));
+  }
+
+  function togglePinned(key: string) {
+    setPinnedCites((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
   }
 
   function toggleExpanded(key: string) {
@@ -77,7 +136,9 @@ export default function Home() {
         answering: false,
       },
     ]);
-    setOpenRules(id);
+    // 조항 목록은 접어둔다. 답변 속 인용 번호를 눌러 근거를 보는 게 본 동작이고,
+    // 이 목록은 검색이 무엇을 물어왔는지 확인할 때만 쓴다.
+    setOpenRules(null);
     setMessage("");
     stick.current = true;
 
@@ -163,7 +224,20 @@ export default function Home() {
         )}
 
         <div className="flex flex-col gap-8">
-          {turns.map((turn) => (
+          {turns.map((turn) => {
+            const parts = turn.answer
+              ? splitAnswer(turn.answer, turn.results ?? [])
+              : [];
+            // 지금 원문을 보여줄 조항들. 누른 것 + 마우스를 올린 것.
+            const openCites: { key: string; rule: SearchResult }[] = [];
+            for (const part of parts) {
+              if (!("rule" in part)) continue;
+              const key = `${turn.id}:${part.rule.id}`;
+              if (!pinnedCites.has(key) && hoverCite !== key) continue;
+              if (openCites.some((c) => c.key === key)) continue;
+              openCites.push({ key, rule: part.rule });
+            }
+            return (
             <section key={turn.id} className="flex flex-col gap-3">
               {/* 질문 */}
               <div className="flex justify-end">
@@ -185,9 +259,61 @@ export default function Home() {
 
               {turn.answer && (
                 <div className="rounded-lg border border-zinc-300 bg-white p-4 text-sm whitespace-pre-line text-black dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50">
-                  {turn.answer}
+                  {parts.map((part, i) =>
+                    "rule" in part ? (
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => togglePinned(`${turn.id}:${part.rule.id}`)}
+                        onMouseEnter={() => setHoverCite(`${turn.id}:${part.rule.id}`)}
+                        onMouseLeave={() =>
+                          setHoverCite((h) =>
+                            h === `${turn.id}:${part.rule.id}` ? null : h,
+                          )
+                        }
+                        title={`${part.rule.title} — 눌러서 전문 보기`}
+                        className={`mx-0.5 rounded px-1 font-medium underline decoration-dotted underline-offset-2 ${
+                          pinnedCites.has(`${turn.id}:${part.rule.id}`)
+                            ? "bg-amber-200 text-black dark:bg-amber-300"
+                            : "text-blue-700 hover:bg-zinc-100 dark:text-blue-400 dark:hover:bg-zinc-800"
+                        }`}
+                      >
+                        {part.cited}
+                      </button>
+                    ) : (
+                      <span key={i}>{part.text}</span>
+                    ),
+                  )}
                 </div>
               )}
+
+              {openCites.map(({ key, rule }) => (
+                <div
+                  key={key}
+                  className="rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-700/60 dark:bg-amber-950/30"
+                >
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="text-sm font-medium text-black dark:text-zinc-50">
+                      {rule.id} {rule.title}
+                    </span>
+                    {pinnedCites.has(key) && (
+                      <button
+                        type="button"
+                        onClick={() => togglePinned(key)}
+                        className="shrink-0 text-xs text-zinc-500 underline underline-offset-2"
+                      >
+                        닫기
+                      </button>
+                    )}
+                  </div>
+                  <p className="mt-1 text-xs text-zinc-500">
+                    {rule.source} · {rule.chapter}
+                  </p>
+                  <p className="mt-2 max-h-72 overflow-y-auto text-sm whitespace-pre-line text-zinc-700 dark:text-zinc-300">
+                    {rule.text}
+                  </p>
+                </div>
+              ))}
 
               {turn.results && !turn.answer && !turn.answering && (
                 <p className="text-xs text-zinc-500">
@@ -257,7 +383,8 @@ export default function Home() {
                 </details>
               )}
             </section>
-          ))}
+            );
+          })}
         </div>
       </main>
 
