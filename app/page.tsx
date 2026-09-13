@@ -101,12 +101,28 @@ export default function Home() {
     setTurns((ts) => ts.map((t) => (t.id === id ? { ...t, ...next } : t)));
   }
 
-  function togglePinned(key: string) {
+  /**
+   * 열어둔 원문을 닫는다.
+   *
+   * 마우스를 올려 연 것도 여기서만 닫는다. 커서가 벗어났다고 닫으면,
+   * 아래로 읽어 내려가는 순간 사라진다. 조항 하나가 4,000자까지 되므로
+   * 마우스를 올려둔 채로 읽는 건 불가능하다.
+   */
+  function closeCite(key: string) {
     setPinnedCites((prev) => {
       const next = new Set(prev);
-      if (!next.delete(key)) next.add(key);
+      next.delete(key);
       return next;
     });
+    setHoverCite((h) => (h === key ? null : h));
+  }
+
+  function toggleCite(key: string) {
+    if (pinnedCites.has(key) || hoverCite === key) {
+      closeCite(key);
+      return;
+    }
+    setPinnedCites((prev) => new Set(prev).add(key));
   }
 
   function toggleExpanded(key: string) {
@@ -264,16 +280,14 @@ export default function Home() {
                       <button
                         key={i}
                         type="button"
-                        onClick={() => togglePinned(`${turn.id}:${part.rule.id}`)}
+                        onClick={() => toggleCite(`${turn.id}:${part.rule.id}`)}
+                        // 커서가 벗어나도 닫지 않는다. 닫기는 '닫기' 버튼이나
+                        // 번호를 다시 누르는 것으로만 한다.
                         onMouseEnter={() => setHoverCite(`${turn.id}:${part.rule.id}`)}
-                        onMouseLeave={() =>
-                          setHoverCite((h) =>
-                            h === `${turn.id}:${part.rule.id}` ? null : h,
-                          )
-                        }
-                        title={`${part.rule.title} — 눌러서 전문 보기`}
+                        title={`${part.rule.title} — 눌러서 여닫기`}
                         className={`mx-0.5 rounded px-1 font-medium underline decoration-dotted underline-offset-2 ${
-                          pinnedCites.has(`${turn.id}:${part.rule.id}`)
+                          pinnedCites.has(`${turn.id}:${part.rule.id}`) ||
+                          hoverCite === `${turn.id}:${part.rule.id}`
                             ? "bg-amber-200 text-black dark:bg-amber-300"
                             : "text-blue-700 hover:bg-zinc-100 dark:text-blue-400 dark:hover:bg-zinc-800"
                         }`}
@@ -296,15 +310,13 @@ export default function Home() {
                     <span className="text-sm font-medium text-black dark:text-zinc-50">
                       {rule.id} {rule.title}
                     </span>
-                    {pinnedCites.has(key) && (
-                      <button
-                        type="button"
-                        onClick={() => togglePinned(key)}
-                        className="shrink-0 text-xs text-zinc-500 underline underline-offset-2"
-                      >
-                        닫기
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      onClick={() => closeCite(key)}
+                      className="shrink-0 text-xs text-zinc-500 underline underline-offset-2 hover:text-black dark:hover:text-zinc-50"
+                    >
+                      닫기
+                    </button>
                   </div>
                   <p className="mt-1 text-xs text-zinc-500">
                     {rule.source} · {rule.chapter}
