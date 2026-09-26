@@ -1,13 +1,20 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { SearchResult } from "@/lib/search";
+import {
+  getServerTurns,
+  getTurns,
+  subscribe,
+  updateTurns,
+  type Turn,
+} from "./chat-history";
 
 // 목록에서 조항을 이만큼만 보여주고, 나머지는 "전체 보기"로 펼친다.
 const PREVIEW_CHARS = 300;
 
 // 모델이 "정의-40"을 "정의‑40"(유니코드 하이픈)으로 적는 일이 잦다.
-const DASHES = /[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g;
+const DASHES = /[‐-―−﹘﹣－]/g;
 // 답변 끝에 붙는 대괄호 표기. [주1]이나 [규칙집에서 찾지 못했습니다]처럼
 // 조항 번호가 아닌 것도 들어오므로 안쪽을 한 번 더 걸러낸다.
 const BRACKET = /\[([^\]\n]{1,80})\]/g;
@@ -52,21 +59,13 @@ function splitAnswer(text: string, results: SearchResult[]) {
   return parts;
 }
 
-/** 질문 하나와 그에 딸린 결과. 물어볼 때마다 하나씩 쌓인다. */
-interface Turn {
-  id: number;
-  question: string;
-  results: SearchResult[] | null;
-  answer: string | null;
-  searchError: string | null;
-  answerError: string | null;
-  searching: boolean;
-  answering: boolean;
-}
-
 export default function Home() {
   const [message, setMessage] = useState("");
-  const [turns, setTurns] = useState<Turn[]>([]);
+  // 이 브라우저에 남아 있는 대화. 서버에서 그릴 때와 하이드레이션 직후에는
+  // null(아직 안 읽음)이고, 곧바로 저장된 내역으로 바뀐다.
+  const stored = useSyncExternalStore(subscribe, getTurns, getServerTurns);
+  const loaded = stored !== null;
+  const turns = stored ?? [];
   // 조항 목록은 한 번에 한 질문 것만 펼친다. 한 질문에 30개씩 나와서
   // 다 펼쳐두면 지난 질문을 찾아보기가 어렵다.
   const [openRules, setOpenRules] = useState<number | null>(null);
@@ -79,26 +78,39 @@ export default function Home() {
   const [pinnedCites, setPinnedCites] = useState<Set<string>>(new Set());
   const [hoverCite, setHoverCite] = useState<string | null>(null);
 
-  const last = turns[turns.length - 1];
-  const busy = Boolean(last && (last.searching || last.answering));
+  // 재검색으로 중간의 질문이 다시 진행 중이 될 수 있어 전부 본다.
+  const busy = turns.some((t) => t.searching || t.answering);
 
-  // 새 글이 붙으면 따라 내려간다. 단, 지난 질문을 읽으려고 위로 올려둔
+  // 대화 영역만 스크롤되고, 제목과 입력창은 제자리에 있다.
+  // 새 글이 붙으면 따라 내려가되, 지난 질문을 읽으려고 위로 올려둔
   // 상태라면 끌어내리지 않는다.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const stick = useRef(true);
+  function handleScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }
   useEffect(() => {
-    const onScroll = () => {
-      const bottom = document.body.scrollHeight - window.innerHeight;
-      stick.current = window.scrollY >= bottom - 80;
-    };
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
-  }, []);
-  useEffect(() => {
-    if (stick.current) window.scrollTo({ top: document.body.scrollHeight });
-  }, [turns]);
+    const el = scrollRef.current;
+    if (el && stick.current) el.scrollTop = el.scrollHeight;
+  }, [stored]);
 
   function patch(id: number, next: Partial<Turn>) {
-    setTurns((ts) => ts.map((t) => (t.id === id ? { ...t, ...next } : t)));
+    updateTurns((ts) => ts.map((t) => (t.id === id ? { ...t, ...next } : t)));
+  }
+
+  /** 대화를 비우고 처음 화면으로 돌아간다. */
+  function startNewChat() {
+    updateTurns(() => []);
+    setOpenRules(null);
+    setExpanded(new Set());
+    setPinnedCites(new Set());
+    setHoverCite(null);
+    setMessage("");
+    stick.current = true;
+    inputRef.current?.focus();
   }
 
   /**
@@ -133,13 +145,13 @@ export default function Home() {
     });
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const question = message.trim();
     if (!question || busy) return;
 
     const id = Date.now();
-    setTurns((ts) => [
+    updateTurns((ts) => [
       ...ts,
       {
         id,
@@ -157,7 +169,34 @@ export default function Home() {
     setOpenRules(null);
     setMessage("");
     stick.current = true;
+    void ask(id, question);
+  }
 
+  /**
+   * 실패했거나 중간에 끊긴 질문을 그 자리에서 다시 묻는다.
+   *
+   * 새 질문으로 아래에 붙이지 않고 원래 자리를 고쳐 쓴다. 실패한 질문과
+   * 다시 물은 질문이 둘 다 남으면 어느 게 최신인지 헷갈린다.
+   */
+  function retry(turn: Turn) {
+    if (busy) return;
+    patch(turn.id, {
+      results: null,
+      answer: null,
+      searchError: null,
+      answerError: null,
+      searching: true,
+      answering: false,
+    });
+    // 이 질문에서 열어둔 원문과 목록은 새 결과와 안 맞으니 닫는다.
+    const mine = `${turn.id}:`;
+    setOpenRules((o) => (o === turn.id ? null : o));
+    setPinnedCites((prev) => new Set([...prev].filter((k) => !k.startsWith(mine))));
+    setHoverCite((h) => (h?.startsWith(mine) ? null : h));
+    void ask(turn.id, turn.question);
+  }
+
+  async function ask(id: number, question: string) {
     // 검색과 AI 답변을 동시에 요청한다. 답변 쪽이 훨씬 오래 걸리므로
     // 검색이 끝난 뒤에 시작하면 그만큼 손해다.
     const searchPromise = fetch("/api/search", {
@@ -224,195 +263,228 @@ export default function Home() {
   }
 
   return (
-    <div className="flex flex-1 flex-col bg-zinc-50 font-sans dark:bg-black">
-      <header className="sticky top-0 z-10 border-b border-zinc-200 bg-zinc-50/90 backdrop-blur dark:border-zinc-800 dark:bg-black/90">
-        <div className="mx-auto w-full max-w-2xl px-6 py-4">
-          <h1 className="text-lg font-semibold text-black dark:text-zinc-50">
-            KBO 규칙 검색 테스트
-          </h1>
-          <p className="mt-0.5 text-xs text-zinc-600 dark:text-zinc-400">
-            KBO 공식 야구규칙과 KBO 리그 규정에서 찾아 답합니다.
-          </p>
+    <div className="flex h-dvh flex-col bg-zinc-50 font-sans dark:bg-black">
+      <header className="shrink-0 border-b border-zinc-200 dark:border-zinc-800">
+        <div className="mx-auto flex w-full max-w-2xl items-center justify-between gap-4 px-6 py-4">
+          <div>
+            <h1 className="text-lg font-semibold text-black dark:text-zinc-50">
+              KBO 규칙 검색 테스트
+            </h1>
+            <p className="mt-0.5 text-xs text-zinc-600 dark:text-zinc-400">
+              KBO 공식 야구규칙과 KBO 리그 규정에서 찾아 답합니다.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={startNewChat}
+            disabled={turns.length === 0}
+            className="shrink-0 rounded-lg border border-zinc-300 px-3 py-1.5 text-sm text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 disabled:hover:bg-transparent dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+          >
+            새 대화
+          </button>
         </div>
       </header>
 
-      <main className="mx-auto w-full max-w-2xl flex-1 px-6 pt-6 pb-4">
-        {turns.length === 0 && (
-          <p className="py-16 text-center text-sm text-zinc-500">
-            궁금한 규칙을 물어보세요. 예: 인필드 플라이 조건은?
-          </p>
-        )}
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto"
+      >
+        <main className="mx-auto w-full max-w-2xl px-6 pt-6 pb-4">
+          {loaded && turns.length === 0 && (
+            <p className="py-16 text-center text-sm text-zinc-500">
+              궁금한 규칙을 물어보세요. 예: 인필드 플라이 조건은?
+            </p>
+          )}
 
-        <div className="flex flex-col gap-8">
-          {turns.map((turn) => {
-            const parts = turn.answer
-              ? splitAnswer(turn.answer, turn.results ?? [])
-              : [];
-            // 지금 원문을 보여줄 조항들. 누른 것 + 마우스를 올린 것.
-            const openCites: { key: string; rule: SearchResult }[] = [];
-            for (const part of parts) {
-              if (!("rule" in part)) continue;
-              const key = `${turn.id}:${part.rule.id}`;
-              if (!pinnedCites.has(key) && hoverCite !== key) continue;
-              if (openCites.some((c) => c.key === key)) continue;
-              openCites.push({ key, rule: part.rule });
-            }
-            return (
-            <section key={turn.id} className="flex flex-col gap-3">
-              {/* 질문 */}
-              <div className="flex justify-end">
-                <p className="max-w-[85%] rounded-2xl rounded-br-sm bg-black px-4 py-2 text-sm text-white dark:bg-white dark:text-black">
-                  {turn.question}
-                </p>
-              </div>
-
-              {turn.searchError && (
-                <p className="text-sm text-red-600">{turn.searchError}</p>
-              )}
-
-              {turn.answering && !turn.answer && (
-                <div className="flex items-center gap-2 text-sm text-zinc-500">
-                  <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent" />
-                  AI가 조항을 읽고 답변을 정리하는 중…
-                </div>
-              )}
-
-              {turn.answer && (
-                <div className="rounded-lg border border-zinc-300 bg-white p-4 text-sm whitespace-pre-line text-black dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50">
-                  {parts.map((part, i) =>
-                    "rule" in part ? (
-                      <button
-                        key={i}
-                        type="button"
-                        onClick={() => toggleCite(`${turn.id}:${part.rule.id}`)}
-                        // 커서가 벗어나도 닫지 않는다. 닫기는 '닫기' 버튼이나
-                        // 번호를 다시 누르는 것으로만 한다.
-                        onMouseEnter={() => setHoverCite(`${turn.id}:${part.rule.id}`)}
-                        title={`${part.rule.title} — 눌러서 여닫기`}
-                        className={`mx-0.5 rounded px-1 font-medium underline decoration-dotted underline-offset-2 ${
-                          pinnedCites.has(`${turn.id}:${part.rule.id}`) ||
-                          hoverCite === `${turn.id}:${part.rule.id}`
-                            ? "bg-amber-200 text-black dark:bg-amber-300"
-                            : "text-blue-700 hover:bg-zinc-100 dark:text-blue-400 dark:hover:bg-zinc-800"
-                        }`}
-                      >
-                        {part.cited}
-                      </button>
-                    ) : (
-                      <span key={i}>{part.text}</span>
-                    ),
-                  )}
-                </div>
-              )}
-
-              {openCites.map(({ key, rule }) => (
-                <div
-                  key={key}
-                  className="rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-700/60 dark:bg-amber-950/30"
-                >
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="text-sm font-medium text-black dark:text-zinc-50">
-                      {rule.id} {rule.title}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => closeCite(key)}
-                      className="shrink-0 text-xs text-zinc-500 underline underline-offset-2 hover:text-black dark:hover:text-zinc-50"
-                    >
-                      닫기
-                    </button>
+          <div className="flex flex-col gap-8">
+            {turns.map((turn) => {
+              const parts = turn.answer
+                ? splitAnswer(turn.answer, turn.results ?? [])
+                : [];
+              // 지금 원문을 보여줄 조항들. 누른 것 + 마우스를 올린 것.
+              const openCites: { key: string; rule: SearchResult }[] = [];
+              for (const part of parts) {
+                if (!("rule" in part)) continue;
+                const key = `${turn.id}:${part.rule.id}`;
+                if (!pinnedCites.has(key) && hoverCite !== key) continue;
+                if (openCites.some((c) => c.key === key)) continue;
+                openCites.push({ key, rule: part.rule });
+              }
+              return (
+                <section key={turn.id} className="flex flex-col gap-3">
+                  {/* 질문 */}
+                  <div className="flex justify-end">
+                    <p className="max-w-[85%] rounded-2xl rounded-br-sm bg-black px-4 py-2 text-sm text-white dark:bg-white dark:text-black">
+                      {turn.question}
+                    </p>
                   </div>
-                  <p className="mt-1 text-xs text-zinc-500">
-                    {rule.source} · {rule.chapter}
-                  </p>
-                  {/* 전문을 그대로 보여준다. 높이를 제한하고 안쪽에 스크롤을
-                      두면 잘린 줄 모르고 지나친다. 조항 하나가 1,400자면
-                      920px인데 288px만 보이고 있었다. */}
-                  <p className="mt-2 text-sm whitespace-pre-line text-zinc-700 dark:text-zinc-300">
-                    {rule.text}
-                  </p>
-                </div>
-              ))}
 
-              {turn.results && !turn.answer && !turn.answering && (
-                <p className="text-xs text-zinc-500">
-                  {turn.answerError
-                    ? `AI 답변 실패: ${turn.answerError} 검색된 조항만 보여줍니다.`
-                    : "(AI 답변을 만들지 못해 검색된 조항만 보여줍니다.)"}
-                </p>
-              )}
+                  {turn.answering && !turn.answer && (
+                    <div className="flex items-center gap-2 text-sm text-zinc-500">
+                      <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent" />
+                      AI가 조항을 읽고 답변을 정리하는 중…
+                    </div>
+                  )}
 
-              {turn.results && (
-                <details className="text-sm" open={openRules === turn.id}>
-                  <summary
-                    className="cursor-pointer text-zinc-500 select-none"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      setOpenRules(openRules === turn.id ? null : turn.id);
-                    }}
-                  >
-                    검색된 조항 {turn.results.length}개
-                  </summary>
-                  <ul className="mt-3 flex flex-col gap-3">
-                    {turn.results.length === 0 && (
-                      <li className="text-sm text-zinc-500">
-                        일치하는 조항을 찾지 못했습니다.
-                      </li>
-                    )}
-                    {turn.results.map((r) => {
-                      const key = `${turn.id}:${r.id}`;
-                      const isLong = r.text.length > PREVIEW_CHARS;
-                      const isOpen = expanded.has(key);
-                      return (
-                        <li
-                          key={key}
-                          className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
+                  {turn.answer && (
+                    <div className="rounded-lg border border-zinc-300 bg-white p-4 text-sm whitespace-pre-line text-black dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50">
+                      {parts.map((part, i) =>
+                        "rule" in part ? (
+                          <button
+                            key={i}
+                            type="button"
+                            onClick={() => toggleCite(`${turn.id}:${part.rule.id}`)}
+                            // 커서가 벗어나도 닫지 않는다. 닫기는 '닫기' 버튼이나
+                            // 번호를 다시 누르는 것으로만 한다.
+                            onMouseEnter={() => setHoverCite(`${turn.id}:${part.rule.id}`)}
+                            title={`${part.rule.title} — 눌러서 여닫기`}
+                            className={`mx-0.5 rounded px-1 font-medium underline decoration-dotted underline-offset-2 ${
+                              pinnedCites.has(`${turn.id}:${part.rule.id}`) ||
+                              hoverCite === `${turn.id}:${part.rule.id}`
+                                ? "bg-amber-200 text-black dark:bg-amber-300"
+                                : "text-blue-700 hover:bg-zinc-100 dark:text-blue-400 dark:hover:bg-zinc-800"
+                            }`}
+                          >
+                            {part.cited}
+                          </button>
+                        ) : (
+                          <span key={i}>{part.text}</span>
+                        ),
+                      )}
+                    </div>
+                  )}
+
+                  {openCites.map(({ key, rule }) => (
+                    <div
+                      key={key}
+                      className="rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-700/60 dark:bg-amber-950/30"
+                    >
+                      <div className="flex items-baseline justify-between gap-2">
+                        <span className="text-sm font-medium text-black dark:text-zinc-50">
+                          {rule.id} {rule.title}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => closeCite(key)}
+                          className="shrink-0 text-xs text-zinc-500 underline underline-offset-2 hover:text-black dark:hover:text-zinc-50"
                         >
-                          <div className="flex items-baseline justify-between gap-2">
-                            <span className="font-medium text-black dark:text-zinc-50">
-                              {r.id} {r.title}
-                            </span>
-                            <span className="shrink-0 text-xs text-zinc-500">
-                              score {r.score.toFixed(3)}
-                            </span>
-                          </div>
-                          <p className="mt-1 text-xs text-zinc-500">
-                            {r.source} · {r.chapter}
-                          </p>
-                          <p className="mt-2 text-sm whitespace-pre-line text-zinc-700 dark:text-zinc-300">
-                            {isLong && !isOpen
-                              ? r.text.slice(0, PREVIEW_CHARS) + "…"
-                              : r.text}
-                          </p>
-                          {isLong && (
-                            <button
-                              type="button"
-                              onClick={() => toggleExpanded(key)}
-                              className="mt-2 text-xs text-zinc-500 underline underline-offset-2 hover:text-black dark:hover:text-zinc-50"
-                            >
-                              {isOpen
-                                ? "접기"
-                                : `전체 보기 (${r.text.length.toLocaleString()}자)`}
-                            </button>
-                          )}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </details>
-              )}
-            </section>
-            );
-          })}
-        </div>
-      </main>
+                          닫기
+                        </button>
+                      </div>
+                      <p className="mt-1 text-xs text-zinc-500">
+                        {rule.source} · {rule.chapter}
+                      </p>
+                      {/* 전문을 그대로 보여준다. 높이를 제한하고 안쪽에 스크롤을
+                          두면 잘린 줄 모르고 지나친다. 조항 하나가 1,400자면
+                          920px인데 288px만 보이고 있었다. */}
+                      <p className="mt-2 text-sm whitespace-pre-line text-zinc-700 dark:text-zinc-300">
+                        {rule.text}
+                      </p>
+                    </div>
+                  ))}
 
-      <div className="sticky bottom-0 border-t border-zinc-200 bg-zinc-50/90 backdrop-blur dark:border-zinc-800 dark:bg-black/90">
+                  {!turn.searching &&
+                    !turn.answering &&
+                    (turn.searchError || turn.answerError || !turn.answer) && (
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+                        <span
+                          className={
+                            turn.searchError ? "text-red-600" : "text-zinc-500"
+                          }
+                        >
+                          {turn.searchError
+                            ? `검색 실패: ${turn.searchError}`
+                            : turn.answer
+                              ? turn.answerError
+                              : turn.answerError
+                                ? `AI 답변 실패: ${turn.answerError} 검색된 조항만 보여줍니다.`
+                                : "AI 답변을 만들지 못해 검색된 조항만 보여줍니다."}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => retry(turn)}
+                          disabled={busy}
+                          className="rounded border border-zinc-300 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                        >
+                          재검색
+                        </button>
+                      </div>
+                    )}
+
+                  {turn.results && (
+                    <details className="text-sm" open={openRules === turn.id}>
+                      <summary
+                        className="cursor-pointer text-zinc-500 select-none"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setOpenRules(openRules === turn.id ? null : turn.id);
+                        }}
+                      >
+                        검색된 조항 {turn.results.length}개
+                      </summary>
+                      <ul className="mt-3 flex flex-col gap-3">
+                        {turn.results.length === 0 && (
+                          <li className="text-sm text-zinc-500">
+                            일치하는 조항을 찾지 못했습니다.
+                          </li>
+                        )}
+                        {turn.results.map((r) => {
+                          const key = `${turn.id}:${r.id}`;
+                          const isLong = r.text.length > PREVIEW_CHARS;
+                          const isOpen = expanded.has(key);
+                          return (
+                            <li
+                              key={key}
+                              className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
+                            >
+                              <div className="flex items-baseline justify-between gap-2">
+                                <span className="font-medium text-black dark:text-zinc-50">
+                                  {r.id} {r.title}
+                                </span>
+                                <span className="shrink-0 text-xs text-zinc-500">
+                                  score {r.score.toFixed(3)}
+                                </span>
+                              </div>
+                              <p className="mt-1 text-xs text-zinc-500">
+                                {r.source} · {r.chapter}
+                              </p>
+                              <p className="mt-2 text-sm whitespace-pre-line text-zinc-700 dark:text-zinc-300">
+                                {isLong && !isOpen
+                                  ? r.text.slice(0, PREVIEW_CHARS) + "…"
+                                  : r.text}
+                              </p>
+                              {isLong && (
+                                <button
+                                  type="button"
+                                  onClick={() => toggleExpanded(key)}
+                                  className="mt-2 text-xs text-zinc-500 underline underline-offset-2 hover:text-black dark:hover:text-zinc-50"
+                                >
+                                  {isOpen
+                                    ? "접기"
+                                    : `전체 보기 (${r.text.length.toLocaleString()}자)`}
+                                </button>
+                              )}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </details>
+                  )}
+                </section>
+              );
+            })}
+          </div>
+        </main>
+      </div>
+
+      <div className="shrink-0 border-t border-zinc-200 dark:border-zinc-800">
         <form
           onSubmit={handleSubmit}
           className="mx-auto flex w-full max-w-2xl gap-2 px-6 py-4"
         >
           <input
+            ref={inputRef}
             type="text"
             value={message}
             onChange={(e) => setMessage(e.target.value)}
