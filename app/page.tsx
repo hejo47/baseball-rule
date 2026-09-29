@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { SearchResult } from "@/lib/search";
+import { ANSWER_DONE } from "@/lib/answer-done";
 import {
   getServerTurns,
   getTurns,
@@ -228,6 +229,7 @@ export default function Home() {
 
     // 2단계: AI 답변은 다 쓰일 때까지 기다리지 않고, 오는 대로 이어 붙인다.
     patch(id, { answering: true });
+    let text = "";
     try {
       const res = await answerPromise;
       if (!res.ok) {
@@ -240,26 +242,38 @@ export default function Home() {
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let text = "";
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         text += decoder.decode(value, { stream: true });
-        patch(id, { answer: text });
+        patch(id, { answer: text.replace(ANSWER_DONE, "") });
       }
       text += decoder.decode();
-      patch(id, { answer: text.trim() || null, answering: false });
-      // 모델이 두 번 다 아무것도 내놓지 못하면 빈 채로 끝난다.
-      // 그때는 검색된 조항이라도 바로 보이게 펼쳐둔다.
-      if (!text.trim()) setOpenRules(id);
     } catch (err) {
-      patch(id, {
-        answer: null,
-        answerError: err instanceof Error ? err.message : "답변 생성 실패",
-        answering: false,
-      });
-      setOpenRules(id);
+      // 글이 오다가 연결이 끊긴 것은 아래에서 '중간에 끊김'으로 다룬다.
+      if (!text) {
+        patch(id, {
+          answer: null,
+          answerError: err instanceof Error ? err.message : "답변 생성 실패",
+          answering: false,
+        });
+        setOpenRules(id);
+        return;
+      }
     }
+
+    // 끝까지 쓰였다는 표시가 없으면 중간에 끊긴 것이다. 받은 데까지는
+    // 남겨두고, 끊겼다는 것을 알려 다시 물을 수 있게 한다.
+    const finished = text.endsWith(ANSWER_DONE);
+    const answer = text.replace(ANSWER_DONE, "").trim() || null;
+    patch(id, {
+      answer,
+      answerError: answer && !finished ? "답변이 중간에 끊겼습니다." : null,
+      answering: false,
+    });
+    // 모델이 두 번 다 아무것도 내놓지 못하면 빈 채로 끝난다.
+    // 그때는 검색된 조항이라도 바로 보이게 펼쳐둔다.
+    if (!answer) setOpenRules(id);
   }
 
   return (
@@ -407,7 +421,8 @@ export default function Home() {
                           disabled={busy}
                           className="rounded border border-zinc-300 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
                         >
-                          재검색
+                          {/* 답이 중간에 끊겼으면 검색은 멀쩡하니 '다시 시도'가 맞는 말이다. */}
+                          {turn.answer ? "다시 시도" : "재검색"}
                         </button>
                       </div>
                     )}

@@ -10,15 +10,26 @@ const CONTEXT_LIMIT = 8;
 // 끝나므로, 이 값은 모델이 폭주할 때만 걸리는 안전장치다.
 const MAX_TOKENS = 900;
 
+// 첫 글자가 이 시간 안에 오지 않으면 포기하고 검색된 조항만 보여준다.
+// 빈 답이라 한 번 더 부르는 것까지 합친 시간이다. 보통은 1~4초면 온다.
+export const FIRST_TEXT_MS = 20_000;
+// 글이 나오기 시작한 뒤에는 전체 시간을 제한하지 않는다. 느려도 쓰고 있으면
+// 끝까지 받는다. 다만 새 글이 이만큼 오지 않으면 서버가 멈춘 것으로 보고 끊는다.
+// 정상일 때 조각은 0.1초 안팎으로 오므로 3초 공백이면 멈춘 것이다. 멈췄다는
+// 신호가 따로 오지 않아서, 글이 멎은 채로 사용자를 오래 세워두지 않는 게 낫다.
+//
+// 예전에는 전체 60초(Vercel 함수 제한)에서 잘렸다. 무료 API가 가끔 느려져
+// 20초를 넘기는 답이 측정 30문항 중 1~2개씩 나왔다.
+export const STALL_MS = 3_000;
+
 function getClient(): OpenAI | null {
   const apiKey = process.env.NVIDIA_API_KEY;
   if (!apiKey) return null;
   return new OpenAI({
     apiKey,
     baseURL: "https://integrate.api.nvidia.com/v1",
-    // 무료 API가 종종 응답을 아예 주지 않는다. 그때 서버가 같이 멈추지
-    // 않도록 끊고, 검색 결과만이라도 돌려준다.
-    // 스트리밍이라 첫 글자는 보통 1~4초 안에 오고, 끝까지도 10초를 넘지 않는다.
+    // 응답이 시작될 때까지만 걸리는 제한이다(SDK가 헤더를 받으면 푼다).
+    // 실제로는 라우트가 FIRST_TEXT_MS에서 먼저 끊으니 안전장치일 뿐이다.
     timeout: 30_000,
     maxRetries: 0,
   });
@@ -123,8 +134,15 @@ function toAnswerError(err: unknown): AnswerError {
  * 빈 응답으로 나가 화면에는 이유 없는 "실패"만 떴다.)
  *
  * 검색된 조항이 없으면 답변할 근거가 없으므로 null을 준다. 이건 에러가 아니다.
+ *
+ * signal을 끊으면 호출이 멈춘다. 스트림이 이미 흐르는 중이면 에러 없이
+ * 그 자리에서 끝나므로, 끊겼는지는 부른 쪽이 signal.aborted로 본다.
  */
-export async function openAnswerStream(question: string, results: SearchResult[]) {
+export async function openAnswerStream(
+  question: string,
+  results: SearchResult[],
+  signal?: AbortSignal,
+) {
   const client = getClient();
   if (!client) {
     throw new AnswerError("서버에 NVIDIA_API_KEY가 설정되지 않았습니다.", 503);
@@ -132,23 +150,32 @@ export async function openAnswerStream(question: string, results: SearchResult[]
   if (results.length === 0) return null;
 
   try {
-    return await client.chat.completions.create({
-      model: MODEL,
-      messages: [{ role: "user", content: buildPrompt(question, results) }],
-      // 규칙집 문장을 정확히 옮기는 일이라 매번 다르게 쓸 이유가 없다.
-      // 0.2에서는 같은 질문에 답이 매번 달라져, 프롬프트를 고쳤을 때
-      // 좋아진 것인지 운인지 구분할 수 없었다. 사용자 입장에서도 어제 물은
-      // 답과 오늘 답이 달라지는 건 규칙 설명으로 곤란하다.
-      temperature: 0,
-      max_tokens: MAX_TOKENS,
-      // 작은 모델이 같은 문장을 무한 반복하는 것을 막는다.
-      frequency_penalty: 0.5,
-      // 이 프로젝트는 규칙 조항을 그대로 인용해 요약하는 일이라
-      // 긴 추론이 필요 없다. 속도에 가장 크게 영향을 주는 설정이다.
-      reasoning_effort: "low",
-      stream: true,
-    });
+    return await client.chat.completions.create(
+      {
+        model: MODEL,
+        messages: [{ role: "user", content: buildPrompt(question, results) }],
+        // 규칙집 문장을 정확히 옮기는 일이라 매번 다르게 쓸 이유가 없다.
+        // 0.2에서는 같은 질문에 답이 매번 달라져, 프롬프트를 고쳤을 때
+        // 좋아진 것인지 운인지 구분할 수 없었다. 사용자 입장에서도 어제 물은
+        // 답과 오늘 답이 달라지는 건 규칙 설명으로 곤란하다.
+        temperature: 0,
+        max_tokens: MAX_TOKENS,
+        // 작은 모델이 같은 문장을 무한 반복하는 것을 막는다.
+        frequency_penalty: 0.5,
+        // 이 프로젝트는 규칙 조항을 그대로 인용해 요약하는 일이라
+        // 긴 추론이 필요 없다. 속도에 가장 크게 영향을 주는 설정이다.
+        reasoning_effort: "low",
+        stream: true,
+      },
+      { signal },
+    );
   } catch (err) {
+    if (signal?.aborted) {
+      throw new AnswerError(
+        `AI가 ${FIRST_TEXT_MS / 1000}초 안에 답을 시작하지 못했습니다.`,
+        504,
+      );
+    }
     throw toAnswerError(err);
   }
 }
@@ -169,6 +196,9 @@ export async function openAnswerStream(question: string, results: SearchResult[]
  * (reasoning_effort 기본값에서는 첫 글자까지 25~45초, 전체 45~140초)
  * reasoning_effort를 low로 낮추고 답변 길이를 제한해 전체 7초 안팎으로,
  * 스트리밍으로 첫 글자는 1~4초 만에 화면에 뜨게 한다.
+ *
+ * 답이 MAX_TOKENS에서 잘렸으면 끝에서 에러를 던진다. 라우트는 이를
+ * 다른 끊김과 똑같이 다뤄, 화면이 "중간에 끊겼다"고 알릴 수 있게 한다.
  */
 export async function* readAnswerStream(
   stream: Awaited<ReturnType<typeof openAnswerStream>>,
@@ -177,8 +207,10 @@ export async function* readAnswerStream(
 
   let sawContent = false;
   let reasoning = "";
+  let finish: string | null = null;
 
   for await (const chunk of stream) {
+    finish = chunk.choices[0]?.finish_reason ?? finish;
     const delta = chunk.choices[0]?.delta as
       | { content?: string | null; reasoning_content?: string | null }
       | undefined;
@@ -199,5 +231,8 @@ export async function* readAnswerStream(
       "모델이 답변 본문을 내놓지 않았습니다. 추론 내용: " +
         (reasoning.trim().slice(0, 200) || "(없음)"),
     );
+  }
+  if (finish === "length") {
+    throw new Error(`답변이 토큰 한도(${MAX_TOKENS})에서 잘렸습니다.`);
   }
 }

@@ -18,8 +18,11 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import OpenAI from "openai";
 
 const BASE = process.env.EVAL_BASE ?? "http://localhost:3000";
-// 사용자가 기다려주는 한계. 넘기면 끊고 "미완"으로 기록해 측정 시간을 아낀다.
-const PATIENCE_MS = 20_000;
+// lib/llm.ts의 FIRST_TEXT_MS, STALL_MS와 같은 값이어야 한다.
+// 첫 글자는 20초까지 기다리고, 그 뒤로는 글이 3초 멈추면 끊긴 것으로 친다.
+// 글이 계속 나오는 동안에는 앱처럼 전체 시간을 제한하지 않는다.
+const FIRST_TEXT_MS = 20_000;
+const STALL_MS = 3_000;
 // lib/llm.ts의 CONTEXT_LIMIT과 같은 값이어야 한다.
 // --context N 으로 덮어써서 "조항을 몇 개 넘기는 게 좋은가"를 실험할 수 있다.
 const DEFAULT_CONTEXT_LIMIT = 8;
@@ -335,42 +338,73 @@ ${question}`;
 // 스트리밍으로 받아 첫 글자까지의 시간을 잰다. 이전 설정은 스트리밍이
 // 아니었지만, 같은 조건에서 재야 비교가 되므로 양쪽 다 스트리밍으로 잰다.
 // (이전 설정에서는 어차피 첫 글자가 곧 완료 시점이나 마찬가지였다.)
+//
+// 끊는 기준은 app/api/chat/route.ts와 같다. 다만 빈 답일 때 다시 부르지는
+// 않는다. 빈 답이 몇 번 나오는지도 재야 할 값이라서다.
 async function measure(prompt, params) {
   const started = Date.now();
   let ttft = null;
   let text = "";
   let usage = null;
-  let cut = false;
+  let finish = null;
+  // 글 조각 사이의 가장 긴 공백. STALL_MS를 정할 근거가 된다.
+  let last = started;
+  let maxGap = 0;
 
-  const stream = await client.chat.completions.create({
-    model: MODEL,
-    messages: [{ role: "user", content: prompt }],
-    temperature: 0,
-    stream: true,
-    stream_options: { include_usage: true },
-    ...params,
-  });
+  const controller = new AbortController();
+  let timer = setTimeout(() => controller.abort(), FIRST_TEXT_MS);
+  try {
+    const stream = await client.chat.completions.create(
+      {
+        model: MODEL,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0,
+        stream: true,
+        stream_options: { include_usage: true },
+        ...params,
+      },
+      { signal: controller.signal },
+    );
 
-  for await (const chunk of stream) {
-    const piece = chunk.choices[0]?.delta?.content ?? "";
-    if (piece && ttft === null) ttft = Date.now() - started;
-    text += piece;
-    if (chunk.usage) usage = chunk.usage;
-    if (Date.now() - started > PATIENCE_MS) {
-      cut = true;
-      break;
+    // 끊으면 스트림은 에러 없이 그 자리에서 끝난다.
+    for await (const chunk of stream) {
+      finish = chunk.choices[0]?.finish_reason ?? finish;
+      if (chunk.usage) usage = chunk.usage;
+      const piece = chunk.choices[0]?.delta?.content ?? "";
+      if (!piece) continue;
+      const now = Date.now();
+      if (ttft === null) ttft = now - started;
+      else maxGap = Math.max(maxGap, now - last);
+      last = now;
+      text += piece;
+      clearTimeout(timer);
+      timer = setTimeout(() => controller.abort(), STALL_MS);
     }
+  } catch (err) {
+    // 응답이 시작되기 전에 첫 글자 시한이 지나면 여기로 온다.
+    if (!controller.signal.aborted) throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  if (cut) await stream.controller.abort();
+
+  const cutReason = controller.signal.aborted
+    ? ttft === null
+      ? "첫글자"
+      : "멈춤"
+    : finish === "length"
+      ? "한도"
+      : null;
 
   return {
     total: Date.now() - started,
     ttft,
+    maxGap: ttft === null ? null : maxGap,
     text: text.trim(),
     chars: text.trim().length,
     outTokens: usage?.completion_tokens ?? null,
     promptTokens: usage?.prompt_tokens ?? null,
-    cut,
+    cut: cutReason !== null,
+    cutReason,
   };
 }
 
@@ -436,7 +470,7 @@ const cell = (r) => {
   return `${r.verdict}${score}${flag} ${(r.total / 1000).toFixed(1)}s`;
 };
 
-console.log(`대상: ${BASE} · 모델: ${MODEL} · ${questions.length}문항 · 조항 ${CONTEXT_LIMIT}개 · 대기 한계 ${PATIENCE_MS / 1000}초\n`);
+console.log(`대상: ${BASE} · 모델: ${MODEL} · ${questions.length}문항 · 조항 ${CONTEXT_LIMIT}개 · 첫 글자 ${FIRST_TEXT_MS / 1000}초 · 멈춤 ${STALL_MS / 1000}초\n`);
 console.log(width("질문", 34) + width("난이도", 8) + RUN.map((n) => width(PRESETS[n].label, 22)).join(""));
 console.log("-".repeat(34 + 8 + 22 * RUN.length));
 for (const row of rows) {
@@ -473,10 +507,17 @@ for (const name of RUN) {
     빈답변: count("빈답변"),
     없는조항_지어냄: rs.filter((r) => r.invented?.length).length,
     컨텍스트밖_인용: rs.filter((r) => r.outside?.length).length,
-    "20초 안에 답변 완료": done.length,
+    "끊기지 않고 답변 완료": done.length,
     "20초 안에 첫 글자 표시": shown.length,
+    "끊김 - 글이 3초 멈춤": rs.filter((r) => r.cutReason === "멈춤").length,
+    "끊김 - 토큰 한도": rs.filter((r) => r.cutReason === "한도").length,
     "완료된 것의 평균 시간(초)": Number((avg(done, (r) => r.total) / 1000).toFixed(1)),
     "첫 글자까지 평균(초)": Number((avg(shown, (r) => r.ttft) / 1000).toFixed(1)),
+    // 멈춤 기준(STALL_MS)이 너무 짧지 않은지 본다. 끊긴 답의 공백은
+    // 기준에 걸려 잘린 것이라 뺀다.
+    "조각 사이 최대 공백(초)": Number(
+      (Math.max(0, ...done.map((r) => r.maxGap ?? 0)) / 1000).toFixed(1),
+    ),
     "평균 답변 길이(자)": Math.round(avg(done, (r) => r.chars)),
   };
   summaries[name] = summary;
@@ -495,8 +536,8 @@ for (const name of RUN) {
   console.log(`  ${width("없는 조항 번호 지어냄", 26)}: ${summary.없는조항_지어냄}`);
   console.log(`  ${width("안 넘긴 조항 끌어다 씀", 26)}: ${summary.컨텍스트밖_인용}`);
   console.log(`  ── 속도 ──`);
-  for (const k of ["20초 안에 답변 완료", "20초 안에 첫 글자 표시", "완료된 것의 평균 시간(초)", "첫 글자까지 평균(초)", "평균 답변 길이(자)"]) {
-    const suffix = k.startsWith("20초") ? `/${summary.문항}` : "";
+  for (const k of ["끊기지 않고 답변 완료", "20초 안에 첫 글자 표시", "끊김 - 글이 3초 멈춤", "끊김 - 토큰 한도", "완료된 것의 평균 시간(초)", "첫 글자까지 평균(초)", "조각 사이 최대 공백(초)", "평균 답변 길이(자)"]) {
+    const suffix = k.includes("(") ? "" : `/${summary.문항}`;
     console.log(`  ${width(k, 26)}: ${summary[k]}${suffix}`);
   }
 }
@@ -507,5 +548,5 @@ const out = new URL(
   import.meta.url,
 );
 await mkdir(new URL("../results/", import.meta.url), { recursive: true });
-await writeFile(out, JSON.stringify({ base: BASE, model: MODEL, patienceMs: PATIENCE_MS, contextLimit: CONTEXT_LIMIT, presets: RUN, summaries, rows }, null, 2));
+await writeFile(out, JSON.stringify({ base: BASE, model: MODEL, firstTextMs: FIRST_TEXT_MS, stallMs: STALL_MS, contextLimit: CONTEXT_LIMIT, presets: RUN, summaries, rows }, null, 2));
 console.log(`\n결과 저장: results/${decodeURIComponent(out.pathname.split("/").pop())}`);
