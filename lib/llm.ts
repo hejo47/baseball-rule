@@ -3,7 +3,12 @@ import type { SearchResult } from "@/lib/search";
 
 // NVIDIA build.nvidia.com은 OpenAI 호환 엔드포인트를 무료로 제공한다.
 // https://build.nvidia.com/models 에서 API 키를 받아 NVIDIA_API_KEY로 설정하면 된다.
-const MODEL = process.env.NVIDIA_MODEL ?? "openai/gpt-oss-20b";
+//
+// 예전에는 openai/gpt-oss-20b를 썼다. 260929에 그 모델이 모든 호출에서 60초
+// 동안 응답하지 않아, 그날 응답하던 모델 중 가장 나은 것으로 바꿨다.
+// 정확도는 같다(같은 21문항에서 16/21 대 16/21, 채점 항목 48/56 대 49/56).
+// 조금 느리다(평균 5.8초 -> 7.9초).
+const MODEL = process.env.NVIDIA_MODEL ?? "nvidia/nemotron-3-super-120b-a12b";
 // 조항 하나가 2,500자까지 되므로 너무 많이 넘기면 응답이 크게 느려진다.
 const CONTEXT_LIMIT = 8;
 // 추론 + 답변을 합친 상한. reasoning_effort를 낮추면 실제로는 200~300토큰이면
@@ -31,7 +36,14 @@ function getClient(): OpenAI | null {
     // 응답이 시작될 때까지만 걸리는 제한이다(SDK가 헤더를 받으면 푼다).
     // 실제로는 라우트가 FIRST_TEXT_MS에서 먼저 끊으니 안전장치일 뿐이다.
     timeout: 30_000,
-    maxRetries: 0,
+    // nemotron-3-super는 요청 10개 중 2~3개를 곧바로(0.1초) 503 "Service
+    // temporarily overloaded"로 거절한다. 다시 부르면 대개 된다. SDK가 503·429를
+    // 0.5·1·2초 기다렸다 다시 부른다.
+    //
+    // 측정(260929, 30문항): 재시도 없이 8~9개 실패 -> 3번이면 3개.
+    // 과부하가 15초 넘게 이어지는 때도 있어 5번으로 늘려도 7개가 실패했다.
+    // 더 늘리면 FIRST_TEXT_MS만 잡아먹으니, 남는 실패는 화면의 재검색에 맡긴다.
+    maxRetries: 3,
   });
 }
 

@@ -15,6 +15,7 @@
  * 따로 채점해야 "정확도"를 올렸는지 알 수 있다.
  */
 import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import OpenAI from "openai";
 
 const BASE = process.env.EVAL_BASE ?? "http://localhost:3000";
@@ -124,7 +125,8 @@ const REGRADE = regradeAt === -1 ? null : args[regradeAt + 1];
 let RUN = names.length ? names : ["current"];
 
 try {
-  process.loadEnvFile(new URL("../.env.local", import.meta.url).pathname);
+  // .pathname은 Windows에서 "/C:/..."에 한글이 %EC..로 남아 파일을 못 찾는다.
+  process.loadEnvFile(fileURLToPath(new URL("../.env.local", import.meta.url)));
 } catch {
   // 이미 환경변수로 넣어뒀다면 파일이 없어도 된다.
 }
@@ -137,9 +139,10 @@ const client = new OpenAI({
   apiKey: process.env.NVIDIA_API_KEY,
   baseURL: "https://integrate.api.nvidia.com/v1",
   timeout: 180_000,
-  maxRetries: 0,
+  // lib/llm.ts와 같게 둔다. 과부하(503)로 문항이 통째로 빠지면 비교가 안 된다.
+  maxRetries: 3,
 });
-const MODEL = process.env.NVIDIA_MODEL ?? "openai/gpt-oss-20b";
+const MODEL = process.env.NVIDIA_MODEL ?? "nvidia/nemotron-3-super-120b-a12b";
 
 const testset = JSON.parse(
   await readFile(new URL("../data/testset.json", import.meta.url), "utf8"),

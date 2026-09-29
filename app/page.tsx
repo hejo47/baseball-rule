@@ -18,7 +18,11 @@ const PREVIEW_CHARS = 300;
 const DASHES = /[‐-―−﹘﹣－]/g;
 // 답변 끝에 붙는 대괄호 표기. [주1]이나 [규칙집에서 찾지 못했습니다]처럼
 // 조항 번호가 아닌 것도 들어오므로 안쪽을 한 번 더 걸러낸다.
-const BRACKET = /\[([^\]\n]{1,80})\]/g;
+//
+// 괄호도 받는다. nemotron-3-super는 대괄호로 달라고 해도 네 번에 한 번꼴로
+// "(정의-40, 주1)"처럼 괄호로 적는다(측정 260929). 괄호 속 설명 문장은
+// 조항 번호가 없어 아래 RULE_ID에서 걸러진다.
+const BRACKET = /\[([^\]\n]{1,80})\]|\(([^)\n]{1,80})\)/g;
 const RULE_ID = /(리그-[가-힣A-Za-z0-9()\-①-⑳]+|정의-\d{1,3}|\d{1,2}\.\d{2}[⒜-⒵⑴-⒇]*)/;
 
 const flatId = (s: string) => s.replace(DASHES, "-").replace(/\s+/g, "");
@@ -48,7 +52,7 @@ function splitAnswer(text: string, results: SearchResult[]) {
   const parts: ({ text: string } | { cited: string; rule: SearchResult })[] = [];
   let at = 0;
   for (const m of text.matchAll(BRACKET)) {
-    const inner = m[1].replace(DASHES, "-");
+    const inner = (m[1] ?? m[2]).replace(DASHES, "-");
     const found = inner.match(RULE_ID);
     const rule = found ? findRule(found[1], results) : null;
     if (!rule) continue;
