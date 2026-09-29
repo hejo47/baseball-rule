@@ -319,7 +319,12 @@ async function searchApi(message) {
 function buildPrompt(question, results, tail) {
   const shown = results.slice(0, CONTEXT_LIMIT);
   const context = shown
-    .map((r) => `[${r.id}] ${r.title} (${r.source})\n${r.text}`)
+    // lib/llm.ts와 같게 사람 말 설명(data/plain.json)을 같이 준다.
+    .map(
+      (r) =>
+        `[${r.id}] ${r.title} (${r.source})\n${r.text}` +
+        (r.plain ? `\n(쉬운 설명, 규칙집 원문 아님: ${r.plain})` : ""),
+    )
     .join("\n\n---\n\n");
 
   // 프리셋에 따라 넘긴 조항 번호를 지시문에 넣어야 할 때가 있다.

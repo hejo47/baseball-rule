@@ -68,7 +68,14 @@ function asksTerm(question: string): boolean {
 function buildPrompt(question: string, results: SearchResult[]): string {
   const context = results
     .slice(0, CONTEXT_LIMIT)
-    .map((r) => `[${r.id}] ${r.title} (${r.source})\n${r.text}`)
+    // 사람 말 설명도 같이 준다. 5.09⒝⑸는 "플라이 볼이 포구된 뒤"라고만 적혀
+    // 있어, 조항을 넘겨받고도 라인드라이브 질문에 "찾지 못했습니다"만 3/3번
+    // 답했다. 설명을 같이 주자 3/3번 이 조항을 근거로 들었다(260929).
+    .map(
+      (r) =>
+        `[${r.id}] ${r.title} (${r.source})\n${r.text}` +
+        (r.plain ? `\n(쉬운 설명, 규칙집 원문 아님: ${r.plain})` : ""),
+    )
     .join("\n\n---\n\n");
 
   return `아래는 KBO 공식 야구규칙과 KBO 리그 규정에서 검색으로 찾은 조항들이다.

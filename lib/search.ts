@@ -2,6 +2,8 @@ import rules from "@/data/rules.json";
 import league from "@/data/league.json";
 import synonyms from "@/data/synonyms.json";
 import vectorFile from "@/data/vectors.json";
+import plain from "@/data/plain.json";
+import plainVectorFile from "@/data/plain-vectors.json";
 import { embedQuery } from "@/lib/embedding";
 
 export interface RuleEntry {
@@ -19,6 +21,8 @@ export interface RuleEntry {
 
 export interface SearchResult extends RuleEntry {
   score: number;
+  /** data/plain.json에 적어둔 사람 말 설명. 있는 조항만 붙는다. */
+  plain?: string;
 }
 
 // 야구규칙과 리그 규정을 한 묶음으로 검색한다.
@@ -69,6 +73,35 @@ if (DOC_VECTORS.length !== DOCS.length) {
     `data/vectors.json이 ${DOC_VECTORS.length}개인데 data/rules.json은 ${DOCS.length}개입니다. ` +
       `npm run build:vectors를 다시 돌리세요.`,
   );
+}
+
+// 조항마다 붙여둔 사람 말 설명. 검색에만 쓰고 화면과 AI에는 원문만 나간다.
+//
+// 사전(synonyms.json)은 질문의 '드문 단어' 하나를 규칙집 말로 바꿔줄 뿐이라,
+// 상황을 풀어 쓴 질문은 못 잡는다. "라인드라이브로 잡혔는데 1루 베이스를 밟고
+// 있지 않은 주자는 태그 안 해도 돼?"의 정답 5.09⒝⑸는 규칙집이 "베이스에 다시
+// 닿기 전에"라고만 적어 16등이었다. 사전을 보강해도 14등이었고, 조항 쪽에
+// 사람 말 설명을 붙이자 4등이 됐다. (docs/search.md 5절)
+const PLAIN = new Map(
+  (plain as { id: string; plain: string }[]).map((p) => [p.id, p.plain]),
+);
+const PLAIN_VECTORS = new Map(
+  (plainVectorFile.items as { id: string; plain: string; vector: number[] }[]).map(
+    (p) => [p.id, p],
+  ),
+);
+
+// 없는 조항 번호에 설명을 달거나, 설명만 고치고 벡터를 다시 안 만들면
+// 검색이 조용히 틀린다. 바로 알아차리게 한다.
+for (const [id, text] of PLAIN) {
+  if (!DOCS.some((doc) => doc.id === id)) {
+    throw new Error(`data/plain.json의 ${id}는 규칙집에 없는 조항 번호입니다.`);
+  }
+  if (PLAIN_VECTORS.get(id)?.plain !== text) {
+    throw new Error(
+      `data/plain.json의 ${id} 설명이 벡터와 다릅니다. npm run build:plain을 다시 돌리세요.`,
+    );
+  }
 }
 
 function normalize(text: string): string {
@@ -178,7 +211,12 @@ function getIndex(): Index {
     cached = {
       titleSpace: buildVectorSpace(DOCS.map((doc) => doc.title)),
       englishSpace: buildVectorSpace(DOCS.map((doc) => doc.english ?? "")),
-      textSpace: buildVectorSpace(DOCS.map((doc) => doc.text)),
+      // 사람 말 설명은 본문 뒤에 붙여 같이 색인한다.
+      textSpace: buildVectorSpace(
+        DOCS.map((doc) =>
+          PLAIN.has(doc.id) ? `${doc.text}\n${PLAIN.get(doc.id)}` : doc.text,
+        ),
+      ),
     };
   }
   return cached;
@@ -274,16 +312,25 @@ function lexicalWithSynonyms(query: string): number[] {
   return scores;
 }
 
-/** 질문 벡터와 각 조각 벡터의 코사인 유사도. 벡터가 이미 길이 1이라 내적이다. */
+/**
+ * 질문 벡터와 각 조각 벡터의 코사인 유사도. 벡터가 이미 길이 1이라 내적이다.
+ * 사람 말 설명이 있는 조항은 원문과 설명 중 질문에 더 가까운 쪽을 쓴다.
+ */
 function semanticScores(queryVector: number[]): number[] {
   const norm = Math.sqrt(queryVector.reduce((sum, v) => sum + v * v, 0));
   if (norm === 0) return DOC_VECTORS.map(() => 0);
   const unit = queryVector.map((v) => v / norm);
+  const dot = (vector: number[]) => {
+    let sum = 0;
+    for (let i = 0; i < unit.length; i++) sum += unit[i] * vector[i];
+    return sum;
+  };
 
-  return DOC_VECTORS.map((docVector) => {
-    let dot = 0;
-    for (let i = 0; i < unit.length; i++) dot += unit[i] * docVector[i];
-    return dot;
+  return DOC_VECTORS.map((docVector, i) => {
+    const plainVector = PLAIN_VECTORS.get(DOCS[i].id)?.vector;
+    return plainVector
+      ? Math.max(dot(docVector), dot(plainVector))
+      : dot(docVector);
   });
 }
 
@@ -301,7 +348,10 @@ function rank(scores: number[], topK?: number): SearchResult[] {
     .sort((a, b) => b.score - a.score);
 
   return (topK === undefined ? sorted : sorted.slice(0, topK)).map(
-    ({ entry, score }) => ({ ...entry, score }),
+    ({ entry, score }) => {
+      const note = PLAIN.get(entry.id);
+      return note ? { ...entry, score, plain: note } : { ...entry, score };
+    },
   );
 }
 
