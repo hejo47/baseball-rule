@@ -142,7 +142,7 @@ const client = new OpenAI({
   // lib/llm.ts와 같게 둔다. 과부하(503)로 문항이 통째로 빠지면 비교가 안 된다.
   maxRetries: 3,
 });
-const MODEL = process.env.NVIDIA_MODEL ?? "nvidia/nemotron-3-super-120b-a12b";
+const MODEL = process.env.NVIDIA_MODEL ?? "openai/gpt-oss-20b";
 
 const testset = JSON.parse(
   await readFile(new URL("../data/testset.json", import.meta.url), "utf8"),
