@@ -13,6 +13,9 @@ import {
 // 답이 느린 날은 60초에서 글이 잘렸다.)
 export const maxDuration = 300;
 
+// 빈 답일 때 다시 부르기 전에 기다리는 시간. 과부하는 몇 초씩 몰려 온다.
+const RETRY_DELAYS_MS = [500, 1_000, 2_000, 4_000];
+
 /**
  * 시간이 되면 모델 호출을 끊는 타이머.
  * 새 글이 올 때마다 다시 감아서, 글이 멈춘 시간만 잰다.
@@ -111,12 +114,19 @@ export async function POST(request: Request) {
 
       let { sent, cut } = await pump(answer, dog);
 
-      // 모델이 속으로 생각만 하다 끝나는 일이 이따금 있다. 같은 조건으로
-      // 한 번 더 부르면 대개 답이 나온다. 스트림이 시작되기 전이라
-      // 화면에는 답이 늦게 뜬 것으로만 보인다.
-      // 첫 글자 시한이 이미 지났으면 사용자를 더 붙잡지 않는다.
-      if (answer && sent === 0 && Date.now() < firstTextBy) {
-        console.error("빈 답변 — 한 번 더 시도합니다.");
+      // 한 글자도 못 받았으면 첫 글자 시한 안에서 다시 부른다. 스트림이
+      // 시작되기 전이라 화면에는 답이 늦게 뜬 것으로만 보인다.
+      //
+      // 이유는 둘이다. 모델이 속으로 생각만 하다 끝나는 일이 이따금 있고,
+      // 과부하(503)가 HTTP 200 스트림 안에 에러로 실려 오는 일이 잦다.
+      // 후자는 SDK의 재시도(HTTP 상태 코드만 본다)에 걸리지 않는다.
+      // 측정(260929): 같은 질문 5번 중 2번이 이렇게 빈 답으로 끝났다.
+      for (const delay of RETRY_DELAYS_MS) {
+        if (!answer || sent > 0) break;
+        // 기다렸다 불러도 시한 전에 첫 글자를 받을 여유가 없으면 그만둔다.
+        if (Date.now() + delay + 1_000 >= firstTextBy) break;
+        console.error(`빈 답변 — ${delay}ms 뒤 다시 시도합니다.`);
+        await new Promise((r) => setTimeout(r, delay));
         const retryDog = watchdog(firstTextBy - Date.now());
         const retry = await openAnswerStream(
           message,
