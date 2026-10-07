@@ -12,6 +12,7 @@ import {
   updateTurns,
   type Turn,
 } from "./chat-history";
+import { readAsked, rememberAsked } from "./asked-history";
 
 // 목록에서 조항을 이만큼만 보여주고, 나머지는 "전체 보기"로 펼친다.
 const PREVIEW_CHARS = 300;
@@ -126,8 +127,39 @@ export default function Home() {
     setPinnedCites(new Set());
     setHoverCite(null);
     setMessage("");
+    recall.current = null;
     stick.current = true;
     inputRef.current?.focus();
+  }
+
+  // ↑/↓로 앞서 한 질문(최근 10개, asked-history.ts)을 입력창에 다시 불러온다.
+  // 터미널의 명령 기록과 같다. null이면 기록을 보지 않고 새로 쓰는 중이다.
+  // 기록을 보기 시작할 때 쓰던 글(draft)을 맡아두고, ↓로 끝까지 내려오면 돌려준다.
+  const recall = useRef<{ index: number; draft: string } | null>(null);
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    // 한글을 조합하는 중에 누른 방향키는 조합을 끝내는 데 쓰인다.
+    if (e.nativeEvent.isComposing) return;
+    const past = readAsked();
+    if (past.length === 0) return;
+    e.preventDefault();
+
+    const current = recall.current;
+    if (e.key === "ArrowUp") {
+      const index = current ? Math.max(0, current.index - 1) : past.length - 1;
+      recall.current = { index, draft: current?.draft ?? message };
+      setMessage(past[index]);
+      return;
+    }
+    if (!current) return;
+    if (current.index + 1 >= past.length) {
+      recall.current = null;
+      setMessage(current.draft);
+      return;
+    }
+    recall.current = { ...current, index: current.index + 1 };
+    setMessage(past[current.index + 1]);
   }
 
   /**
@@ -193,6 +225,8 @@ export default function Home() {
     // 이 목록은 검색이 무엇을 물어왔는지 확인할 때만 쓴다.
     setOpenRules(null);
     setMessage("");
+    recall.current = null;
+    rememberAsked(question);
     stick.current = true;
     void ask(id, question, history);
   }
@@ -595,6 +629,7 @@ export default function Home() {
             type="text"
             value={message}
             onChange={(e) => setMessage(e.target.value)}
+            onKeyDown={handleKeyDown}
             placeholder={
               awaitingReply ? "되물은 내용에 답해 주세요" : "예: 인필드 플라이 조건은?"
             }
