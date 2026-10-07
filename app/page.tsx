@@ -462,10 +462,14 @@ export default function Home() {
                     </p>
                   </div>
 
-                  {turn.answering && !turn.answer && (
+                  {/* 보낸 순간부터 표시한다. 검색 중에 아무것도 안 뜨면 멈춘 것처럼
+                      보인다(서버가 막 떴을 때 첫 검색은 형태소 분석기를 불러오느라 2초쯤 걸린다). */}
+                  {(turn.searching || (turn.answering && !turn.answer)) && (
                     <div className="flex items-center gap-2 text-sm text-zinc-500">
                       <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent" />
-                      AI가 조항을 읽고 답변을 정리하는 중…
+                      {turn.searching
+                        ? "규칙집에서 조항을 찾는 중…"
+                        : "AI가 조항을 읽고 답변을 정리하는 중…"}
                     </div>
                   )}
 
