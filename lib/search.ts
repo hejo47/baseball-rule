@@ -178,18 +178,20 @@ if (
 
 interface Index {
   title: Bm25Field;
+  english: Bm25Field;
   body: Bm25Field;
 }
 
 let cached: Index | null = null;
 
-// 제목 칸(제목 + 영문명)과 본문 칸(본문 + 사람 말 설명)을 따로 색인한다.
+// 제목, 영문명, 본문(본문 + 사람 말 설명)을 따로 색인한다.
 // 각자의 문서 집합 안에서 흔한 말(idf)이 따로 계산돼, 제목만의 특징이 묻히지 않는다.
 function getIndex(): Index {
   if (!cached) {
     warnDeadSynonyms();
     cached = {
       title: buildBm25(tokenFile.title),
+      english: buildBm25(tokenFile.english),
       body: buildBm25(tokenFile.body),
     };
   }
@@ -255,14 +257,25 @@ function expandQuery(query: string): string | null {
   return added.length === 0 ? null : `${query} ${added.join(" ")}`;
 }
 
-// 제목 칸과 본문 칸을 각자 최고점으로 나눈 뒤 제목 쪽에 더 큰 가중치로 합친다.
+// 칸마다 그 질문의 최고점으로 나눈다. 제목 점수는 한글 제목과 영문명 중 높은 쪽을
+// 쓰고, 본문보다 큰 가중치로 합친다.
+// 규칙집은 공이 몸에 부딪히는 걸 "맞다"와 "닿다" 둘 다로 쓴다("새에게 맞았을 경우",
+// "페어 볼에 닿았을 경우"). 사람은 거의 "맞다"로만 묻는다. 질문에 "맞다"가 있으면
+// "닿다"도 같이 찾는다. 조항 쪽은 건드리지 않는다("규정에 맞게"처럼 다른 뜻도 있다).
+const SAME_MEANING: Record<string, string[]> = { 맞다: ["닿다"] };
+
 function lexicalScores(query: string): number[] {
-  const { title, body } = getIndex();
-  const words = [...new Set(tokenize(query))];
+  const { title, english, body } = getIndex();
+  const words = [
+    ...new Set(tokenize(query).flatMap((w) => [w, ...(SAME_MEANING[w] ?? [])])),
+  ];
   const titleScores = normalized(bm25Scores(title, words));
+  const englishScores = normalized(bm25Scores(english, words));
   const bodyScores = normalized(bm25Scores(body, words));
   return DOCS.map(
-    (_, i) => titleScores[i] * TITLE_WEIGHT + bodyScores[i] * TEXT_WEIGHT,
+    (_, i) =>
+      Math.max(titleScores[i], englishScores[i]) * TITLE_WEIGHT +
+      bodyScores[i] * TEXT_WEIGHT,
   );
 }
 

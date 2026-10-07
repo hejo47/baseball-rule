@@ -25,9 +25,11 @@ const fields = docs.map((d) => lexicalFields(d, plain.get(d.id)));
 
 const started = Date.now();
 const title = [];
+const english = [];
 const body = [];
 for (const [i, f] of fields.entries()) {
   title.push(tokenize(f.title));
+  english.push(tokenize(f.english));
   body.push(tokenize(f.body));
   if (i % 50 === 0) process.stderr.write(`\r${i}/${fields.length}`);
 }
@@ -40,6 +42,7 @@ await writeFile(
     fingerprint: fieldsFingerprint(fields),
     ids: docs.map((d) => d.id),
     title,
+    english,
     body,
   }),
 );
