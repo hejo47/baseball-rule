@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type { SearchResult } from "@/lib/search";
 import { ANSWER_DONE } from "@/lib/answer-done";
 import { clarificationBody, isClarification } from "@/lib/clarify";
@@ -16,6 +22,12 @@ import { readAsked, rememberAsked } from "./asked-history";
 
 // 목록에서 조항을 이만큼만 보여주고, 나머지는 "전체 보기"로 펼친다.
 const PREVIEW_CHARS = 300;
+
+// 입력창 높이. 한 줄이면 42px(글자 24px + 위아래 여백 16px + 테두리 2px)이고,
+// 길어지면 늘어나다가 INPUT_MAX_HEIGHT에서 멈춘다.
+const INPUT_MAX_HEIGHT = 100;
+// 테두리를 뺀 한 줄 높이. 이보다 크면 글이 여러 줄이다.
+const ONE_LINE_HEIGHT = 40;
 
 // 모델이 "정의-40"을 "정의‑40"(유니코드 하이픈)으로 적는 일이 잦다.
 const DASHES = /[‐-―−﹘﹣－]/g;
@@ -99,7 +111,16 @@ export default function Home() {
   // 새 글이 붙으면 따라 내려가되, 지난 질문을 읽으려고 위로 올려둔
   // 상태라면 끌어내리지 않는다.
   const scrollRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // 입력창은 질문 길이에 맞춰 늘어나되 100px에서 멈추고, 그보다 길면 안에서 스크롤한다.
+  useLayoutEffect(() => {
+    const box = inputRef.current;
+    if (!box) return;
+    box.style.height = "auto";
+    // scrollHeight에는 테두리(위아래 1px)가 빠져 있다.
+    box.style.height = `${Math.min(box.scrollHeight + 2, INPUT_MAX_HEIGHT)}px`;
+  }, [message]);
   const stick = useRef(true);
   function handleScroll() {
     const el = scrollRef.current;
@@ -137,10 +158,28 @@ export default function Home() {
   // 기록을 보기 시작할 때 쓰던 글(draft)을 맡아두고, ↓로 끝까지 내려오면 돌려준다.
   const recall = useRef<{ index: number; draft: string } | null>(null);
 
-  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-    // 한글을 조합하는 중에 누른 방향키는 조합을 끝내는 데 쓰인다.
+  function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    // 한글을 조합하는 중에 누른 Enter나 방향키는 조합을 끝내는 데 쓰인다.
     if (e.nativeEvent.isComposing) return;
+
+    // Enter는 보내기, Shift+Enter는 줄바꿈.
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      e.currentTarget.form?.requestSubmit();
+      return;
+    }
+
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    // 글이 여러 줄이면 ↑/↓는 먼저 줄 사이를 움직이고, 맨 앞(↑)이나 맨 끝(↓)에
+    // 닿은 뒤에 기록으로 넘어간다.
+    const box = e.currentTarget;
+    if (box.scrollHeight > ONE_LINE_HEIGHT) {
+      const atEdge =
+        e.key === "ArrowUp"
+          ? box.selectionStart === 0
+          : box.selectionEnd === box.value.length;
+      if (!atEdge) return;
+    }
     const past = readAsked();
     if (past.length === 0) return;
     e.preventDefault();
@@ -622,23 +661,23 @@ export default function Home() {
       <div className="shrink-0 border-t border-zinc-200 dark:border-zinc-800">
         <form
           onSubmit={handleSubmit}
-          className="mx-auto flex w-full max-w-2xl gap-2 px-6 py-4"
+          className="mx-auto flex w-full max-w-2xl items-end gap-2 px-6 py-4"
         >
-          <input
+          <textarea
             ref={inputRef}
-            type="text"
+            rows={1}
             value={message}
             onChange={(e) => setMessage(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder={
               awaitingReply ? "되물은 내용에 답해 주세요" : "예: 인필드 플라이 조건은?"
             }
-            className="flex-1 rounded-lg border border-zinc-300 bg-white px-4 py-2 text-black outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50"
+            className="flex-1 resize-none rounded-lg border border-zinc-300 bg-white px-4 py-2 text-black outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50"
           />
           <button
             type="submit"
             disabled={busy}
-            className="rounded-lg bg-black px-5 py-2 font-medium text-white disabled:opacity-50 dark:bg-white dark:text-black"
+            className="h-[42px] shrink-0 rounded-lg bg-black px-5 font-medium text-white disabled:opacity-50 dark:bg-white dark:text-black"
           >
             {busy ? "답변 중…" : "검색"}
           </button>
