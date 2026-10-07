@@ -335,7 +335,7 @@ export default function Home() {
         <div className="mx-auto flex w-full max-w-2xl items-center justify-between gap-4 px-6 py-4">
           <div>
             <h1 className="text-lg font-semibold text-black dark:text-zinc-50">
-              KBO 규칙 검색 테스트
+              KBO 규칙 검색기
             </h1>
             <p className="mt-0.5 text-xs text-zinc-600 dark:text-zinc-400">
               KBO 공식 야구규칙과 KBO 리그 규정에서 찾아 답합니다.

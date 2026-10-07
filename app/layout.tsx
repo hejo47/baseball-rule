@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "KBO 규칙 검색",
+  title: "KBO 규칙 검색기",
   description: "KBO 공식 야구규칙과 KBO 리그 규정에서 찾아 답합니다.",
 };
 
