@@ -1,5 +1,7 @@
 import OpenAI from "openai";
 import type { SearchResult } from "@/lib/search";
+import type { PreviousTurn } from "@/lib/conversation";
+import { CLARIFY_PREFIX } from "@/lib/clarify";
 
 // NVIDIA build.nvidia.com은 OpenAI 호환 엔드포인트를 무료로 제공한다.
 // https://build.nvidia.com/models 에서 API 키를 받아 NVIDIA_API_KEY로 설정하면 된다.
@@ -67,7 +69,36 @@ function asksTerm(question: string): boolean {
   return ASKS_TERM.test(question) && !ASKS_CASE.test(question);
 }
 
-function buildPrompt(question: string, results: SearchResult[]): string {
+// 상황이 빠져 답이 갈리는 질문에는 하나를 찍어 답하지 말고 되묻게 한다(261007).
+// "포수가 세 번째 스트라이크를 놓쳤는데 타자가 1루로 뛰면 살 수 있어?"는 1루
+// 주자와 아웃카운트에 따라 답이 갈리는데, 모델은 하나를 골라 단정했다.
+// 단어형("~가 뭐야?")에는 걸지 않는다. 되물을 일이 없다.
+const CLARIFY_RULE = `질문에 빠진 상황(아웃카운트, 주자 위치, 타구가 땅에 닿았는지 등) 때문에 조항에 따라 답이 갈리면,
+하나를 골라 추측하지 말고 "${CLARIFY_PREFIX}:"로 시작해 무엇이 필요한지 한두 문장으로 되물어라.
+답이 갈리지 않으면 되묻지 말고 바로 답하라.`;
+
+/** 앞 대화를 프롬프트에 넣는다. 없으면 빈 문자열. */
+function historySection(history: PreviousTurn[]): string {
+  if (history.length === 0) return "";
+  const turns = history
+    .map((t) => `질문: ${t.question}\n답: ${t.answer}`)
+    .join("\n\n");
+  return `
+# 이전 대화
+${turns}
+
+이번 질문이 이전 대화에 이어지는 것이면(예: "그럼 2아웃이면?") 이전 대화의 상황을 이어받아 답하라.
+이어지지 않는 새 질문이면 이전 대화는 무시하라.
+직전 답이 "${CLARIFY_PREFIX}"로 시작하는 되물음이었으면, 이번 질문은 그에 대한 사용자의 대답이다.
+그 대답을 원래 질문에 더해 원래 질문에 답하라. 다시 되묻지 마라.
+`;
+}
+
+function buildPrompt(
+  question: string,
+  results: SearchResult[],
+  history: PreviousTurn[],
+): string {
   const context = results
     .slice(0, CONTEXT_LIMIT)
     // 사람 말 설명도 같이 준다. 5.09⒝⑸는 "플라이 볼이 포구된 뒤"라고만 적혀
@@ -97,7 +128,8 @@ ${
       ? `질문의 핵심 단어가 들어간 조항 문장은 요약하지 말고 그대로 옮겨 적어라.
 그 문장에 있는 조건, 숫자, 예외를 하나도 빼지 마라.
 그런 다음 3~5문장으로 풀어서 설명하라. 표는 쓰지 말고 줄글로 쓴다.`
-      : `첫 문장에 질문에 대한 결론을 써라. 예/아니오로 답할 수 있는 질문이면 예/아니오부터 말하라.
+      : `${CLARIFY_RULE}
+첫 문장에 질문에 대한 결론을 써라. 예/아니오로 답할 수 있는 질문이면 예/아니오부터 말하라.
 그다음 그 결론의 근거를 설명하라. 결론과 다른 말로 끝내지 마라.
 3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.`
   }
@@ -105,7 +137,7 @@ ${
 
 # 검색된 조항
 ${context}
-
+${historySection(history)}
 # 질문
 ${question}`;
 }
@@ -175,6 +207,7 @@ export async function openAnswerStream(
   question: string,
   results: SearchResult[],
   signal?: AbortSignal,
+  history: PreviousTurn[] = [],
 ) {
   const client = getClient();
   if (!client) {
@@ -186,7 +219,7 @@ export async function openAnswerStream(
     return await client.chat.completions.create(
       {
         model: MODEL,
-        messages: [{ role: "user", content: buildPrompt(question, results) }],
+        messages: [{ role: "user", content: buildPrompt(question, results, history) }],
         // 규칙집 문장을 정확히 옮기는 일이라 매번 다르게 쓸 이유가 없다.
         // 0.2에서는 같은 질문에 답이 매번 달라져, 프롬프트를 고쳤을 때
         // 좋아진 것인지 운인지 구분할 수 없었다. 사용자 입장에서도 어제 물은

@@ -1,4 +1,5 @@
-import { search } from "@/lib/search";
+import { searchInConversation } from "@/lib/search";
+import { parseHistory } from "@/lib/conversation";
 import { ANSWER_DONE } from "@/lib/answer-done";
 import {
   AnswerError,
@@ -53,7 +54,10 @@ export async function POST(request: Request) {
     );
   }
 
-  const results = await search(message);
+  // 앞 대화가 오면 이어지는 질문으로 보고 같이 검색하고 AI에게도 준다.
+  // /api/search와 같은 방식이어야 화면에 뜬 조항과 AI가 본 조항이 같다.
+  const history = parseHistory(body?.history);
+  const results = await searchInConversation(message, history);
 
   // 첫 글자는 다시 부르는 것까지 합쳐 이 시각까지 와야 한다.
   const firstTextBy = Date.now() + FIRST_TEXT_MS;
@@ -63,7 +67,7 @@ export async function POST(request: Request) {
   const dog = watchdog(FIRST_TEXT_MS);
   let answer;
   try {
-    answer = await openAnswerStream(message, results, dog.signal);
+    answer = await openAnswerStream(message, results, dog.signal, history);
   } catch (err) {
     dog.stop();
     console.error("openAnswerStream failed:", err);
@@ -132,6 +136,7 @@ export async function POST(request: Request) {
           message,
           results,
           retryDog.signal,
+          history,
         ).catch(() => null);
         if (retry) ({ sent, cut } = await pump(retry, retryDog));
         else retryDog.stop();

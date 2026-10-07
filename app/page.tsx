@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { SearchResult } from "@/lib/search";
 import { ANSWER_DONE } from "@/lib/answer-done";
+import { clarificationBody, isClarification } from "@/lib/clarify";
+import { HISTORY_LIMIT, type PreviousTurn } from "@/lib/conversation";
 import {
   getServerTurns,
   getTurns,
@@ -86,6 +88,12 @@ export default function Home() {
   // 재검색으로 중간의 질문이 다시 진행 중이 될 수 있어 전부 본다.
   const busy = turns.some((t) => t.searching || t.answering);
 
+  // 마지막 답이 되물음이면 다음 입력은 그 대답으로 이어진다.
+  const last = turns.at(-1);
+  const awaitingReply = Boolean(
+    last?.answer && !last.answering && isClarification(last.answer),
+  );
+
   // 대화 영역만 스크롤되고, 제목과 입력창은 제자리에 있다.
   // 새 글이 붙으면 따라 내려가되, 지난 질문을 읽으려고 위로 올려둔
   // 상태라면 끌어내리지 않는다.
@@ -101,6 +109,10 @@ export default function Home() {
     const el = scrollRef.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
   }, [stored]);
+  // AI가 되물으면 바로 답할 수 있게 입력창으로 커서를 옮긴다.
+  useEffect(() => {
+    if (awaitingReply) inputRef.current?.focus();
+  }, [awaitingReply]);
 
   function patch(id: number, next: Partial<Turn>) {
     updateTurns((ts) => ts.map((t) => (t.id === id ? { ...t, ...next } : t)));
@@ -155,12 +167,20 @@ export default function Home() {
     const question = message.trim();
     if (!question || busy) return;
 
+    // 앞에서 답을 받은 질문들을 같이 보낸다. "그럼 2아웃이면?"처럼 이어지는
+    // 질문이나, AI가 되물은 것에 대한 대답을 이해하려면 앞 대화가 필요하다.
+    const history: PreviousTurn[] = turns
+      .filter((t) => t.answer)
+      .slice(-HISTORY_LIMIT)
+      .map((t) => ({ question: t.question, answer: t.answer! }));
+
     const id = Date.now();
     updateTurns((ts) => [
       ...ts,
       {
         id,
         question,
+        history,
         results: null,
         answer: null,
         searchError: null,
@@ -174,7 +194,7 @@ export default function Home() {
     setOpenRules(null);
     setMessage("");
     stick.current = true;
-    void ask(id, question);
+    void ask(id, question, history);
   }
 
   /**
@@ -199,7 +219,8 @@ export default function Home() {
     setOpenRules((o) => (o === turn.id ? null : o));
     setPinnedCites((prev) => new Set([...prev].filter((k) => !k.startsWith(mine))));
     setHoverCite((h) => (h?.startsWith(mine) ? null : h));
-    void ask(turn.id, turn.question);
+    // 처음 물었을 때와 같은 앞 대화로 다시 묻는다.
+    void ask(turn.id, turn.question, turn.history ?? []);
   }
 
   /**
@@ -229,18 +250,18 @@ export default function Home() {
     }
   }
 
-  async function ask(id: number, question: string) {
+  async function ask(id: number, question: string, history: PreviousTurn[]) {
     // 검색과 AI 답변을 동시에 요청한다. 답변 쪽이 훨씬 오래 걸리므로
     // 검색이 끝난 뒤에 시작하면 그만큼 손해다.
     const searchPromise = fetch("/api/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: question }),
+      body: JSON.stringify({ message: question, history }),
     });
     const answerPromise = fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: question }),
+      body: JSON.stringify({ message: question, history }),
     });
     // 검색이 실패해 아래에서 빠져나가도 예외가 떠돌지 않게 한다.
     answerPromise.catch(() => null);
@@ -345,9 +366,11 @@ export default function Home() {
 
           <div className="flex flex-col gap-8">
             {turns.map((turn) => {
-              const parts = turn.answer
-                ? splitAnswer(turn.answer, turn.results ?? [])
-                : [];
+              // AI가 답 대신 되물었으면 전용 상자에 머리말을 떼고 보여준다.
+              const clarifying = Boolean(turn.answer && isClarification(turn.answer));
+              const shown =
+                turn.answer && clarifying ? clarificationBody(turn.answer) : turn.answer;
+              const parts = shown ? splitAnswer(shown, turn.results ?? []) : [];
               // 지금 원문을 보여줄 조항들. 누른 것 + 마우스를 올린 것.
               const openCites: { key: string; rule: SearchResult }[] = [];
               for (const part of parts) {
@@ -374,7 +397,18 @@ export default function Home() {
                   )}
 
                   {turn.answer && (
-                    <div className="rounded-lg border border-zinc-300 bg-white p-4 text-sm whitespace-pre-line text-black dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50">
+                    <div
+                      className={
+                        clarifying
+                          ? "rounded-lg border border-sky-300 bg-sky-50 p-4 text-sm whitespace-pre-line text-black dark:border-sky-800 dark:bg-sky-950/40 dark:text-zinc-50"
+                          : "rounded-lg border border-zinc-300 bg-white p-4 text-sm whitespace-pre-line text-black dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50"
+                      }
+                    >
+                      {clarifying && (
+                        <p className="mb-1 font-medium text-sky-900 dark:text-sky-200">
+                          조금 더 알려주세요
+                        </p>
+                      )}
                       {parts.map((part, i) =>
                         "rule" in part ? (
                           <button
@@ -397,6 +431,11 @@ export default function Home() {
                         ) : (
                           <span key={i}>{part.text}</span>
                         ),
+                      )}
+                      {turn === last && awaitingReply && (
+                        <p className="mt-3 text-xs text-sky-800 dark:text-sky-300">
+                          아래 입력창에 답하면 이 질문에 이어서 답합니다.
+                        </p>
                       )}
                     </div>
                   )}
@@ -556,7 +595,9 @@ export default function Home() {
             type="text"
             value={message}
             onChange={(e) => setMessage(e.target.value)}
-            placeholder="예: 인필드 플라이 조건은?"
+            placeholder={
+              awaitingReply ? "되물은 내용에 답해 주세요" : "예: 인필드 플라이 조건은?"
+            }
             className="flex-1 rounded-lg border border-zinc-300 bg-white px-4 py-2 text-black outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50"
           />
           <button

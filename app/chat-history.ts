@@ -15,6 +15,7 @@
  * null(아직 안 읽음)을 주고, 브라우저에서 저장된 내역으로 바꿔 끼운다.
  */
 import type { SearchResult } from "@/lib/search";
+import type { PreviousTurn } from "@/lib/conversation";
 
 /** 질문 하나와 그에 딸린 결과. 물어볼 때마다 하나씩 쌓인다. */
 export interface Turn {
@@ -26,6 +27,8 @@ export interface Turn {
   answerError: string | null;
   searching: boolean;
   answering: boolean;
+  /** 이 질문을 할 때 같이 보낸 앞 대화. 다시 시도할 때도 같은 것으로 묻는다. */
+  history?: PreviousTurn[];
   /** "틀렸어요"를 눌렀는지. 같은 답을 두 번 신고하지 않게 남겨둔다. */
   reported?: "sending" | "done" | "failed";
 }

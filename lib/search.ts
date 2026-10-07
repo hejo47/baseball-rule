@@ -5,6 +5,7 @@ import vectorFile from "@/data/vectors.json";
 import plain from "@/data/plain.json";
 import plainVectorFile from "@/data/plain-vectors.json";
 import { embedQuery } from "@/lib/embedding";
+import type { PreviousTurn } from "@/lib/conversation";
 
 export interface RuleEntry {
   id: string;
@@ -372,6 +373,27 @@ export function searchByLetters(query: string, topK?: number): SearchResult[] {
  *
  * topK를 생략하면 점수가 0보다 큰 조항을 전부 반환한다.
  */
+/**
+ * 앞 대화에 이어지는 질문까지 생각해 검색한다.
+ *
+ * "그럼 2아웃이면?"은 혼자서는 무엇을 묻는지 모른다. 앞 질문들을 이번 질문
+ * 앞에 붙여 한 번에 검색한다.
+ *
+ * 이번 질문만으로 한 검색과 섞는 방식도 재봤는데(261007, 이어지는 질문 3개)
+ * 전부 나빴다. 이번 질문만으로 하면 "2아웃"이 들어간 아무 조항이나 1등이라
+ * 섞는 순간 정답이 밀린다. 붙인 것만 쓰면 그럼 2아웃이면? 2등, 되물음에 대한
+ * 대답 6등, 앞 대화와 상관없는 새 질문(피치클락) 6등으로 셋 다 상위 8개 안이다.
+ * (섞을 때: 높은 쪽 29/7/4등, 평균 21/2/5등, 0.3:0.7 16/5/5등)
+ */
+export async function searchInConversation(
+  query: string,
+  history: PreviousTurn[],
+  topK?: number,
+): Promise<SearchResult[]> {
+  if (history.length === 0) return search(query, topK);
+  return search(`${history.map((t) => t.question).join(" ")} ${query}`, topK);
+}
+
 export async function search(
   query: string,
   topK?: number,

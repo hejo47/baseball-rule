@@ -26,11 +26,11 @@ const testset = JSON.parse(
   await readFile(new URL("../data/testset.json", import.meta.url), "utf8"),
 );
 
-async function searchApi(message) {
+async function searchApi(message, history = []) {
   const res = await fetch(`${BASE}/api/search`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, history }),
   });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return (await res.json()).results ?? [];
@@ -41,8 +41,9 @@ let inContext = 0;
 let missing = 0;
 const rows = [];
 
-for (const { q, expect, level } of testset) {
-  const results = await searchApi(q);
+for (const { q, expect, level, history = [] } of testset) {
+  // 앞 대화가 붙은 문항(이어지는 질문)은 앱처럼 앞 대화와 같이 검색한다.
+  const results = await searchApi(q, history);
   const ranks = expect.map((id) => {
     const i = results.findIndex((r) => r.id === id);
     return i === -1 ? Infinity : i + 1;

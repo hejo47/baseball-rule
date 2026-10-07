@@ -5,6 +5,8 @@
  *   node scripts/eval-answer.mjs                 지금 설정으로 측정
  *   node scripts/eval-answer.mjs before current  이전 설정과 나란히 비교
  *   node scripts/eval-answer.mjs --limit 5       앞의 5문항만
+ *   node scripts/eval-answer.mjs --only 스코어 --repeat 8
+ *                                    질문에 "스코어"가 든 문항만 8번씩
  *
  * data/testset.json의 질문마다 실제 /api/search로 조항을 뽑고, 그 조항으로
  * 모델을 직접 호출해 (1) 답이 맞았는지 (2) 첫 글자가 뜨기까지 (3) 답변이
@@ -133,12 +135,64 @@ const PRESETS = {
   },
 };
 
+// 아래 두 프리셋이 같이 쓰는 지시문. lib/llm.ts와 같아야 한다.
+const TERM_TAIL =
+  "질문의 핵심 단어가 들어간 조항 문장은 요약하지 말고 그대로 옮겨 적어라.\n" +
+  "그 문장에 있는 조건, 숫자, 예외를 하나도 빼지 마라.\n" +
+  "그런 다음 3~5문장으로 풀어서 설명하라. 표는 쓰지 말고 줄글로 쓴다.\n";
+const CLARIFY_RULE =
+  "질문에 빠진 상황(아웃카운트, 주자 위치, 타구가 땅에 닿았는지 등) 때문에 조항에 따라 답이 갈리면,\n" +
+  '하나를 골라 추측하지 말고 "확인이 필요합니다:"로 시작해 무엇이 필요한지 한두 문장으로 되물어라.\n' +
+  "답이 갈리지 않으면 되묻지 말고 바로 답하라.\n";
+const CITE_TAIL = "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).";
+
+// 결론먼저에 되묻기만 더한다(261007). 상황이 빠져 답이 갈리는 질문에 하나를
+// 찍어 답하는 대신 되묻게 한다. 단어형("~가 뭐야?")에는 걸지 않는다.
+PRESETS.되묻기 = {
+  label: "되묻기",
+  note: "결론먼저 + 답이 갈리면 되묻기",
+  head: PRESETS.결론먼저.head,
+  tail: (ids, question) =>
+    (ASKS_TERM.test(question) && !ASKS_CASE.test(question)
+      ? TERM_TAIL
+      : CLARIFY_RULE +
+        "첫 문장에 질문에 대한 결론을 써라. 예/아니오로 답할 수 있는 질문이면 예/아니오부터 말하라.\n" +
+        "그다음 그 결론의 근거를 설명하라. 결론과 다른 말로 끝내지 마라.\n" +
+        "3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.\n") + CITE_TAIL,
+  params: PRESETS.결론먼저.params,
+};
+
+// 되묻기에 더해, 결론을 내기 전에 근거 문장부터 그대로 옮기게 한다(261007).
+// 작은 모델은 8개 조항 중 엉뚱한 것(끝내기 질문에 9.05 안타)에 끌려 틀렸다.
+// 규칙집 문장을 먼저 베끼게 하면 결론 전에 맞는 문장을 찾아야 한다.
+PRESETS.근거먼저 = {
+  label: "근거먼저",
+  note: "되묻기 + 근거 문장 -> 적용 -> 결론",
+  head: PRESETS.결론먼저.head,
+  tail: (ids, question) =>
+    (ASKS_TERM.test(question) && !ASKS_CASE.test(question)
+      ? TERM_TAIL
+      : CLARIFY_RULE +
+        "답할 때는 아래 순서를 지켜라.\n" +
+        "근거: 질문에 답이 되는 조항 문장을 그대로 옮겨 적어라.\n" +
+        "적용: 그 문장을 질문 상황에 대입하라.\n" +
+        "결론: 질문에 대한 답을 한 문장으로 써라. 예/아니오로 답할 수 있으면 예/아니오부터 말하라. 근거와 어긋나면 안 된다.\n" +
+        "표는 쓰지 말고 줄글로 쓴다.\n") + CITE_TAIL,
+  params: PRESETS.결론먼저.params,
+};
+
 // 프리셋이 head를 따로 주지 않으면 쓰는, 거부 문장 지시.
 const DEFAULT_HEAD = '조항에 없는 내용은 추측하지 말고 "규칙집에서 찾지 못했습니다"라고 답하라.';
 
 const args = process.argv.slice(2);
 const limitAt = args.indexOf("--limit");
 const LIMIT = limitAt === -1 ? Infinity : Number(args[limitAt + 1]);
+// 같은 질문에도 무료 API의 답이 매번 달라서, 몇 번 중 몇 번 맞는지 보려면
+// 골라서 여러 번 물어야 한다.
+const onlyAt = args.indexOf("--only");
+const ONLY = onlyAt === -1 ? null : args[onlyAt + 1];
+const repeatAt = args.indexOf("--repeat");
+const REPEAT = repeatAt === -1 ? 1 : Number(args[repeatAt + 1]);
 const ctxAt = args.indexOf("--context");
 const CONTEXT_LIMIT = ctxAt === -1 ? DEFAULT_CONTEXT_LIMIT : Number(args[ctxAt + 1]);
 const names = args.filter((a) => PRESETS[a]);
@@ -178,7 +232,10 @@ const rules = [
   ...JSON.parse(await readFile(new URL("../data/rules.json", import.meta.url), "utf8")),
   ...JSON.parse(await readFile(new URL("../data/league.json", import.meta.url), "utf8")),
 ];
-const questions = testset.slice(0, LIMIT);
+const questions = testset
+  .filter((t) => !ONLY || t.q.includes(ONLY))
+  .slice(0, LIMIT)
+  .flatMap((t) => Array.from({ length: REPEAT }, () => t));
 
 // ------------------------------------------------------------- 인용 채점
 
@@ -237,6 +294,9 @@ const REFUSAL = /찾지\s*못했|찾을\s*수\s*없|규칙집에\s*없/;
  * 포기로 분류됐다. (`타임은 언제 선언할 수 있어?`)
  * 진짜 거부는 첫 문장부터 못 찾았다고 말한다.
  */
+// lib/clarify.ts의 isClarification과 같아야 한다.
+const CLARIFY = /^[\s*"“'#>]*확인이 필요합니다/;
+
 function isRefusal(text) {
   const first = text.trim().split(/(?<=[.!?다])\s+/)[0] ?? "";
   return REFUSAL.test(first);
@@ -262,7 +322,7 @@ const flat = (s) => String(s).replace(/\s+/g, "").toLowerCase();
  * 틀렸을 때 "검색 탓"과 "모델 탓"을 가르는 건 그대로 둔다. 다만 기준이
  * 나아졌다. 빠진 내용이 넘겨준 조항 안에 있었으면 모델 탓, 없었으면 검색 탓이다.
  */
-function grade({ expect = [], must, text, contextIds }) {
+function grade({ expect = [], must, text, contextIds, clarify = false }) {
   const cited = parseCitations(text);
   const invented = cited.filter((c) => !RULE_IDS.some((id) => relates(c, id)));
   const outside = cited.filter(
@@ -274,6 +334,17 @@ function grade({ expect = [], must, text, contextIds }) {
   // 모델이 추론만 하다 끝나 본문을 한 글자도 안 뱉는 경우가 있다.
   if (!text.trim()) {
     return { ...base, verdict: "빈답변", correct: false, searchMissed: false };
+  }
+
+  // 되물음. testset에서 clarify: true인 문항(상황이 빠져 답이 갈리는 질문)은
+  // 되물으면 정답이고, 나머지는 멀쩡한 질문에 괜히 되물은 것이라 틀림이다.
+  if (CLARIFY.test(text)) {
+    return {
+      ...base,
+      verdict: clarify ? "되물음" : "괜히되물음",
+      correct: clarify,
+      searchMissed: false,
+    };
   }
 
   const refused = isRefusal(text);
@@ -330,17 +401,32 @@ function grade({ expect = [], must, text, contextIds }) {
 
 // ------------------------------------------------------------- 측정
 
-async function searchApi(message) {
+async function searchApi(message, history = []) {
   const res = await fetch(`${BASE}/api/search`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, history }),
   });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return (await res.json()).results ?? [];
 }
 
-function buildPrompt(question, results, tail, head = DEFAULT_HEAD) {
+// lib/llm.ts의 historySection과 같아야 한다.
+function historySection(history) {
+  if (history.length === 0) return "";
+  const turns = history.map((t) => `질문: ${t.question}\n답: ${t.answer}`).join("\n\n");
+  return `
+# 이전 대화
+${turns}
+
+이번 질문이 이전 대화에 이어지는 것이면(예: "그럼 2아웃이면?") 이전 대화의 상황을 이어받아 답하라.
+이어지지 않는 새 질문이면 이전 대화는 무시하라.
+직전 답이 "확인이 필요합니다"로 시작하는 되물음이었으면, 이번 질문은 그에 대한 사용자의 대답이다.
+그 대답을 원래 질문에 더해 원래 질문에 답하라. 다시 되묻지 마라.
+`;
+}
+
+function buildPrompt(question, results, tail, head = DEFAULT_HEAD, history = []) {
   const shown = results.slice(0, CONTEXT_LIMIT);
   const context = shown
     // lib/llm.ts와 같게 사람 말 설명(data/plain.json)을 같이 준다.
@@ -362,7 +448,7 @@ ${tail}
 
 # 검색된 조항
 ${context}
-
+${historySection(history)}
 # 질문
 ${question}`;
 }
@@ -443,6 +529,7 @@ async function measure(prompt, params) {
 const rows = [];
 // 지난 측정을 다시 채점할 때도 채점 기준은 지금 testset에서 가져온다.
 const MUST = Object.fromEntries(testset.map((t) => [t.q, t.must ?? []]));
+const CLARIFY_OK = Object.fromEntries(testset.map((t) => [t.q, Boolean(t.clarify)]));
 
 if (REGRADE) {
   // 경로는 절대경로이거나 프로젝트 루트 기준 상대경로(results/...)로 받는다.
@@ -457,21 +544,22 @@ if (REGRADE) {
       const run = row.runs[name];
       next.runs[name] = run?.error
         ? run
-        : { ...run, ...grade({ expect: row.expect ?? [], must: MUST[row.q] ?? [], text: run.text, contextIds: row.contextIds }) };
+        : { ...run, ...grade({ expect: row.expect ?? [], must: MUST[row.q] ?? [], text: run.text, contextIds: row.contextIds, clarify: CLARIFY_OK[row.q] }) };
     }
     rows.push(next);
   }
 } else
-for (const { q, expect, level, must = [] } of questions) {
-  const results = await searchApi(q);
+for (const { q, expect, level, must = [], clarify = false, history = [] } of questions) {
+  // 앞 대화가 붙은 문항(이어지는 질문)은 앱처럼 앞 대화와 같이 검색하고 묻는다.
+  const results = await searchApi(q, history);
   const contextIds = results.slice(0, CONTEXT_LIMIT).map((r) => r.id);
   const row = { q, level, expect, must: must.map((m) => m.name), contextIds, runs: {} };
 
   for (const name of RUN) {
     const { tail, head, params } = PRESETS[name];
     try {
-      const run = await measure(buildPrompt(q, results, tail, head), params);
-      row.runs[name] = { ...run, ...grade({ expect, must, text: run.text, contextIds }) };
+      const run = await measure(buildPrompt(q, results, tail, head, history), params);
+      row.runs[name] = { ...run, ...grade({ expect, must, text: run.text, contextIds, clarify }) };
     } catch (err) {
       row.runs[name] = { error: String(err.message).slice(0, 200) };
     }
@@ -537,6 +625,9 @@ for (const name of RUN) {
     검색실패_검색탓: count("검색실패"),
     지어냄_함정오답: count("지어냄"),
     빈답변: count("빈답변"),
+    // 상황이 빠진 질문(clarify)에 되물은 것과, 멀쩡한 질문에 괜히 되물은 것.
+    되물음_애매한질문: count("되물음"),
+    괜히_되물음: count("괜히되물음"),
     없는조항_지어냄: rs.filter((r) => r.invented?.length).length,
     // 제대로 답해놓고 끝에 "규칙집에서 찾지 못했습니다"를 습관처럼 붙인 답.
     // 틀린 답은 아니라 정확도에는 안 잡히지만 읽는 사람을 헷갈리게 한다.
@@ -567,6 +658,8 @@ for (const name of RUN) {
   console.log(`  ${width("  근거 받고도 못 찾겠다 함", 26)}: ${summary.포기_모델탓}`);
   console.log(`  ${width("  함정에 답을 지어냄", 26)}: ${summary.지어냄_함정오답}`);
   console.log(`  ${width("  답변이 비어 있음", 26)}: ${summary.빈답변}`);
+  console.log(`  ${width("  멀쩡한 질문에 되물음", 26)}: ${summary.괜히_되물음}`);
+  console.log(`  ${width("애매한 질문에 되물음 (정답)", 26)}: ${summary.되물음_애매한질문}`);
   console.log(`  ${width("틀림 - 검색 탓", 26)}: ${summary.검색실패_검색탓}`);
   console.log(`  ${width("없는 조항 번호 지어냄", 26)}: ${summary.없는조항_지어냄}`);
   console.log(`  ${width("안 넘긴 조항 끌어다 씀", 26)}: ${summary.컨텍스트밖_인용}`);
