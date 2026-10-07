@@ -4,6 +4,8 @@ import synonyms from "@/data/synonyms.json";
 import vectorFile from "@/data/vectors.json";
 import plain from "@/data/plain.json";
 import plainVectorFile from "@/data/plain-vectors.json";
+import tokenFile from "@/data/tokens.json";
+import { fieldsFingerprint, lexicalFields, tokenize } from "@/lib/tokenizer";
 import { embedQuery } from "@/lib/embedding";
 import type { PreviousTurn } from "@/lib/conversation";
 
@@ -109,115 +111,86 @@ function normalize(text: string): string {
   return text.replace(/\s+/g, "").toLowerCase();
 }
 
-// 한글은 띄어쓰기 기반 토큰화가 어려워 문자 바이그램으로 대체한다.
-function bigrams(text: string): string[] {
-  const normalized = normalize(text);
-  if (normalized.length < 2) return normalized ? [normalized] : [];
-  const grams: string[] = [];
-  for (let i = 0; i < normalized.length - 1; i++) {
-    grams.push(normalized.slice(i, i + 2));
-  }
-  return grams;
-}
+// 글자 점수: 조항과 질문을 형태소로 잘라 BM25로 매긴다.
+//
+// 처음에는 글자를 두 개씩 겹쳐 잘라 TF-IDF 코사인으로 매겼다("인필드플라이" ->
+// 인필/필드/드플/...). 뜻 없이 글자만 겹쳐서, 질문에 "라인드라이브"가 있으면
+// 라인 드라이브의 '정의' 조항을, "몸에 맞는 공"이 있으면 그 말이 든 비디오 판독
+// 목록을 끌어올려 정답을 밀어냈다. 한국어 검색 실무는 형태소 분석 + BM25를 쓴다.
+// 바꾸자 시험 밖 질문 12개의 평균 순위가 7.2등 -> 4.7등이 됐다(261007).
+//
+// 조항 쪽 형태소는 scripts/build-tokens.mjs가 미리 잘라 data/tokens.json에 둔다
+// (oktjs로 457개를 자르는 데 15초쯤 걸린다). 질문만 그때그때 자른다.
+const BM25_K1 = 1.2;
+const BM25_B = 0.75;
 
-function termFrequency(tokens: string[]): Map<string, number> {
-  const tf = new Map<string, number>();
-  for (const token of tokens) {
-    tf.set(token, (tf.get(token) ?? 0) + 1);
-  }
-  return tf;
-}
-
-interface VectorSpace {
-  vectors: Map<string, number>[];
-  norms: number[];
+interface Bm25Field {
+  counts: Map<string, number>[];
+  lengths: number[];
+  averageLength: number;
   idf: Map<string, number>;
 }
 
-// 문서 집합의 텍스트들로부터 TF-IDF 벡터 공간을 만든다.
-// 제목/본문을 따로 색인해야 각자의 문서 집합 안에서 흔한 조각(idf)이
-// 따로 계산돼, 제목만의 특징적인 글자 조합이 묻히지 않는다.
-function buildVectorSpace(texts: string[]): VectorSpace {
-  const docTokens = texts.map(bigrams);
-
+function buildBm25(docsTokens: string[][]): Bm25Field {
+  const counts = docsTokens.map((tokens) => {
+    const count = new Map<string, number>();
+    for (const token of tokens) count.set(token, (count.get(token) ?? 0) + 1);
+    return count;
+  });
   const df = new Map<string, number>();
-  docTokens.forEach((tokens) => {
-    for (const term of new Set(tokens)) {
-      df.set(term, (df.get(term) ?? 0) + 1);
-    }
-  });
-
-  const N = texts.length;
+  for (const count of counts) {
+    for (const token of count.keys()) df.set(token, (df.get(token) ?? 0) + 1);
+  }
+  const N = docsTokens.length;
   const idf = new Map<string, number>();
-  df.forEach((count, term) => {
-    idf.set(term, Math.log(N / count) + 1);
-  });
-
-  const vectors = docTokens.map((tokens) => {
-    const tf = termFrequency(tokens);
-    const vector = new Map<string, number>();
-    tf.forEach((count, term) => {
-      vector.set(term, count * (idf.get(term) ?? 0));
-    });
-    return vector;
-  });
-
-  const norms = vectors.map((vector) =>
-    Math.sqrt(Array.from(vector.values()).reduce((sum, w) => sum + w * w, 0)),
-  );
-
-  return { vectors, norms, idf };
+  df.forEach((n, token) => idf.set(token, Math.log(1 + (N - n + 0.5) / (n + 0.5))));
+  const lengths = docsTokens.map((tokens) => tokens.length);
+  const averageLength = lengths.reduce((sum, n) => sum + n, 0) / N;
+  return { counts, lengths, averageLength, idf };
 }
 
-function cosineScores(space: VectorSpace, query: string): number[] {
-  const queryTf = termFrequency(bigrams(query));
-  const queryVector = new Map<string, number>();
-  queryTf.forEach((count, term) => {
-    const weight = count * (space.idf.get(term) ?? 0);
-    if (weight > 0) queryVector.set(term, weight);
+function bm25Scores(field: Bm25Field, queryTokens: string[]): number[] {
+  return field.counts.map((count, i) => {
+    let score = 0;
+    for (const token of queryTokens) {
+      const f = count.get(token);
+      if (!f) continue;
+      const lengthNorm =
+        1 - BM25_B + (BM25_B * field.lengths[i]) / field.averageLength;
+      score +=
+        (field.idf.get(token) ?? 0) * ((f * (BM25_K1 + 1)) / (f + BM25_K1 * lengthNorm));
+    }
+    return score;
   });
-  const queryNorm = Math.sqrt(
-    Array.from(queryVector.values()).reduce((sum, w) => sum + w * w, 0),
+}
+
+// 규칙집이나 사람 말 설명만 고치고 data/tokens.json을 다시 안 만들면 조항과
+// 형태소가 어긋나 검색이 조용히 틀린다. 바로 알아차리게 한다.
+if (
+  tokenFile.ids.length !== DOCS.length ||
+  tokenFile.fingerprint !==
+    fieldsFingerprint(DOCS.map((doc) => lexicalFields(doc, PLAIN.get(doc.id))))
+) {
+  throw new Error(
+    "data/tokens.json이 지금 규칙집·사람 말 설명과 맞지 않습니다. npm run build:tokens를 다시 돌리세요.",
   );
-
-  if (queryNorm === 0) return space.vectors.map(() => 0);
-
-  return space.vectors.map((vector, i) => {
-    const norm = space.norms[i];
-    if (norm === 0) return 0;
-    let dot = 0;
-    queryVector.forEach((qWeight, term) => {
-      const dWeight = vector.get(term);
-      if (dWeight) dot += qWeight * dWeight;
-    });
-    return dot / (queryNorm * norm);
-  });
 }
 
 interface Index {
-  titleSpace: VectorSpace;
-  englishSpace: VectorSpace;
-  textSpace: VectorSpace;
+  title: Bm25Field;
+  body: Bm25Field;
 }
 
 let cached: Index | null = null;
 
-// 제목과 영문명을 "아웃 OUT"처럼 한 덩어리로 색인하면, 안 쓰는 쪽이 벡터
-// 길이만 늘려 점수를 깎아먹는다. 한글로 "아웃"을 물으면 제목이 "아웃"뿐인
-// 조항은 0.86을 받는데 "아웃 OUT"인 정의-54는 0.287까지 떨어졌다.
-// 따로 색인해 둘 중 높은 쪽을 쓰면 어느 쪽으로 물어도 손해가 없다.
+// 제목 칸(제목 + 영문명)과 본문 칸(본문 + 사람 말 설명)을 따로 색인한다.
+// 각자의 문서 집합 안에서 흔한 말(idf)이 따로 계산돼, 제목만의 특징이 묻히지 않는다.
 function getIndex(): Index {
   if (!cached) {
     warnDeadSynonyms();
     cached = {
-      titleSpace: buildVectorSpace(DOCS.map((doc) => doc.title)),
-      englishSpace: buildVectorSpace(DOCS.map((doc) => doc.english ?? "")),
-      // 사람 말 설명은 본문 뒤에 붙여 같이 색인한다.
-      textSpace: buildVectorSpace(
-        DOCS.map((doc) =>
-          PLAIN.has(doc.id) ? `${doc.text}\n${PLAIN.get(doc.id)}` : doc.text,
-        ),
-      ),
+      title: buildBm25(tokenFile.title),
+      body: buildBm25(tokenFile.body),
     };
   }
   return cached;
@@ -282,17 +255,14 @@ function expandQuery(query: string): string | null {
   return added.length === 0 ? null : `${query} ${added.join(" ")}`;
 }
 
-// 제목 유사도와 본문 유사도를 따로 계산해 제목 쪽에 더 큰 가중치로 합친다.
-// 제목 점수는 한글 제목과 영문명 중 높은 쪽을 쓴다.
+// 제목 칸과 본문 칸을 각자 최고점으로 나눈 뒤 제목 쪽에 더 큰 가중치로 합친다.
 function lexicalScores(query: string): number[] {
-  const { titleSpace, englishSpace, textSpace } = getIndex();
-  const titleScores = cosineScores(titleSpace, query);
-  const englishScores = cosineScores(englishSpace, query);
-  const textScores = cosineScores(textSpace, query);
+  const { title, body } = getIndex();
+  const words = [...new Set(tokenize(query))];
+  const titleScores = normalized(bm25Scores(title, words));
+  const bodyScores = normalized(bm25Scores(body, words));
   return DOCS.map(
-    (_, i) =>
-      Math.max(titleScores[i], englishScores[i]) * TITLE_WEIGHT +
-      textScores[i] * TEXT_WEIGHT,
+    (_, i) => titleScores[i] * TITLE_WEIGHT + bodyScores[i] * TEXT_WEIGHT,
   );
 }
 
