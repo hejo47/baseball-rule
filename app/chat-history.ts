@@ -1,5 +1,10 @@
 /**
- * 지금 대화를 이 브라우저에 남겨둔다. 새로고침하거나 다시 들어와도 이어진다.
+ * 지금 대화를 이 탭에 남겨둔다. 새로고침해도 이어지고, 탭을 닫으면 사라진다.
+ *
+ * 처음엔 localStorage에 둬서 며칠 뒤 다시 들어와도 지난 대화가 그대로 떴다.
+ * 새로 들어왔으면 새 대화로 시작하는 게 맞다고 해서(261007) sessionStorage로
+ * 바꿨다. 브라우저가 탭마다 따로 두고 탭을 닫으면 지우는 저장소다. 그래서
+ * 새 탭으로 열면 그 탭은 새 대화다.
  *
  * 지난 대화 목록은 두지 않는다. 대화는 하나뿐이고, "새 대화"를 누르면 비운다.
  *
@@ -21,6 +26,8 @@ export interface Turn {
   answerError: string | null;
   searching: boolean;
   answering: boolean;
+  /** "틀렸어요"를 눌렀는지. 같은 답을 두 번 신고하지 않게 남겨둔다. */
+  reported?: "sending" | "done" | "failed";
 }
 
 const STORAGE_KEY = "kbo-rules:chat:v1";
@@ -33,7 +40,13 @@ const INTERRUPTED = "답변을 받는 도중에 끊겼습니다.";
 
 function read(): Turn[] {
   try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]");
+    // localStorage에 두던 때의 대화가 브라우저에 남아 있다. 이제 읽지 않으니 치운다.
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // 저장소를 못 쓰는 브라우저면 남은 것도 없다.
+  }
+  try {
+    const parsed: unknown = JSON.parse(sessionStorage.getItem(STORAGE_KEY) ?? "[]");
     if (!Array.isArray(parsed)) return [];
     // 답변을 받는 도중에 새로고침했으면 그 질문은 멈춘 채로 되살리고,
     // 끊겼다는 걸 알린다. 받던 데까지는 남긴다. 화면은 오류가 있는
@@ -65,8 +78,7 @@ let leaving = false;
 
 function saveBeforeLeaving() {
   if (leaving) return;
-  // 아직 저장 못 한 게 있을 때만 쓴다. 무조건 쓰면 다른 창에서 비운
-  // 대화를 이 창이 들고 있던 내역으로 되살려 놓는다.
+  // 아직 저장 못 한 게 있을 때만 쓴다. 나머지는 이미 저장돼 있다.
   if (pendingSave) {
     clearTimeout(pendingSave);
     pendingSave = null;
@@ -116,7 +128,7 @@ function persist(next: Turn[]) {
   let keep = next;
   for (;;) {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(keep));
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(keep));
       return;
     } catch {
       if (keep.length <= 1) return;

@@ -192,6 +192,7 @@ export default function Home() {
       answerError: null,
       searching: true,
       answering: false,
+      reported: undefined,
     });
     // 이 질문에서 열어둔 원문과 목록은 새 결과와 안 맞으니 닫는다.
     const mine = `${turn.id}:`;
@@ -199,6 +200,33 @@ export default function Home() {
     setPinnedCites((prev) => new Set([...prev].filter((k) => !k.startsWith(mine))));
     setHoverCite((h) => (h?.startsWith(mine) ? null : h));
     void ask(turn.id, turn.question);
+  }
+
+  /**
+   * 틀린 답을 신고한다. 질문과 답, AI에게 넘긴 조항 번호를 보낸다.
+   *
+   * 대화는 탭을 닫으면 사라져서, 틀린 답을 나중에 다시 볼 방법이 이것뿐이다.
+   * 조항 번호가 있어야 틀린 게 검색 탓(정답 조항이 안 넘어감)인지 모델
+   * 탓(넘겨받고도 못 씀)인지 가를 수 있다.
+   */
+  async function report(turn: Turn) {
+    if (!turn.answer || turn.reported === "sending" || turn.reported === "done") return;
+    patch(turn.id, { reported: "sending" });
+    try {
+      const res = await fetch("/api/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: turn.question,
+          answer: turn.answer,
+          // /api/chat이 AI에게 넘기는 개수(lib/llm.ts의 CONTEXT_LIMIT)와 같다.
+          contextIds: (turn.results ?? []).slice(0, 8).map((r) => r.id),
+        }),
+      });
+      patch(turn.id, { reported: res.ok ? "done" : "failed" });
+    } catch {
+      patch(turn.id, { reported: "failed" });
+    }
   }
 
   async function ask(id: number, question: string) {
@@ -369,6 +397,27 @@ export default function Home() {
                         ) : (
                           <span key={i}>{part.text}</span>
                         ),
+                      )}
+                    </div>
+                  )}
+
+                  {turn.answer && !turn.answering && (
+                    <div className="flex justify-end text-xs">
+                      {turn.reported === "done" ? (
+                        <span className="text-zinc-500">신고했습니다. 고맙습니다.</span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => report(turn)}
+                          disabled={turn.reported === "sending"}
+                          className="text-zinc-500 underline underline-offset-2 hover:text-black disabled:opacity-40 dark:hover:text-zinc-50"
+                        >
+                          {turn.reported === "sending"
+                            ? "보내는 중…"
+                            : turn.reported === "failed"
+                              ? "신고를 보내지 못했습니다 · 다시 보내기"
+                              : "틀렸어요"}
+                        </button>
                       )}
                     </div>
                   )}

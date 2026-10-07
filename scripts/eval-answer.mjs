@@ -64,7 +64,7 @@ const PRESETS = {
       "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).",
     params: { max_tokens: 900, frequency_penalty: 0.5, reasoning_effort: "low" },
   },
-  // lib/llm.ts에 실제로 들어간 방식. 질문 형태에 따라 지시를 나눈다.
+  // 260912~261006에 lib/llm.ts에 들어 있던 방식. 질문 형태에 따라 지시를 나눈다.
   형태별: {
     label: "형태별",
     note: "단어형에만 문장 그대로",
@@ -110,7 +110,31 @@ const PRESETS = {
       "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).",
     params: { max_tokens: 900, frequency_penalty: 0.5, reasoning_effort: "low" },
   },
+  // lib/llm.ts에 실제로 들어간 방식(261007). 형태별에 두 가지를 더했다.
+  // "찾지 못했습니다"는 근거가 없을 때 그 한 문장만 쓰게 하고(맞게 답해놓고
+  // 끝에 습관처럼 붙였다), 상황형 질문은 결론을 첫 문장에 쓰게 한다(맞게
+  // 말해놓고 끝에서 뒤집는 답이 나왔다).
+  결론먼저: {
+    label: "결론먼저",
+    note: "찾지 못함은 한 문장만 · 상황형은 결론부터",
+    head:
+      '조항으로 답할 수 없으면 추측하지 말고 "규칙집에서 찾지 못했습니다" 한 문장만 써라.\n' +
+      "조항으로 답했다면 이 문장을 붙이지 마라.",
+    tail: (ids, question) =>
+      (ASKS_TERM.test(question) && !ASKS_CASE.test(question)
+        ? "질문의 핵심 단어가 들어간 조항 문장은 요약하지 말고 그대로 옮겨 적어라.\n" +
+          "그 문장에 있는 조건, 숫자, 예외를 하나도 빼지 마라.\n" +
+          "그런 다음 3~5문장으로 풀어서 설명하라. 표는 쓰지 말고 줄글로 쓴다.\n"
+        : "첫 문장에 질문에 대한 결론을 써라. 예/아니오로 답할 수 있는 질문이면 예/아니오부터 말하라.\n" +
+          "그다음 그 결론의 근거를 설명하라. 결론과 다른 말로 끝내지 마라.\n" +
+          "3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.\n") +
+      "답변 끝에 참고한 조항 번호를 대괄호로 표기하라 (예: [5.05⑵]).",
+    params: { max_tokens: 900, frequency_penalty: 0.5, reasoning_effort: "low" },
+  },
 };
+
+// 프리셋이 head를 따로 주지 않으면 쓰는, 거부 문장 지시.
+const DEFAULT_HEAD = '조항에 없는 내용은 추측하지 말고 "규칙집에서 찾지 못했습니다"라고 답하라.';
 
 const args = process.argv.slice(2);
 const limitAt = args.indexOf("--limit");
@@ -316,7 +340,7 @@ async function searchApi(message) {
   return (await res.json()).results ?? [];
 }
 
-function buildPrompt(question, results, tail) {
+function buildPrompt(question, results, tail, head = DEFAULT_HEAD) {
   const shown = results.slice(0, CONTEXT_LIMIT);
   const context = shown
     // lib/llm.ts와 같게 사람 말 설명(data/plain.json)을 같이 준다.
@@ -332,7 +356,7 @@ function buildPrompt(question, results, tail) {
 
   return `아래는 KBO 공식 야구규칙과 KBO 리그 규정에서 검색으로 찾은 조항들이다.
 이 조항들만 근거로 질문에 답하라.
-조항에 없는 내용은 추측하지 말고 "규칙집에서 찾지 못했습니다"라고 답하라.
+${head}
 근거가 어느 문서에서 왔는지 답변에 밝혀라. 야구규칙과 리그 규정은 다른 문서다.
 ${tail}
 
@@ -444,9 +468,9 @@ for (const { q, expect, level, must = [] } of questions) {
   const row = { q, level, expect, must: must.map((m) => m.name), contextIds, runs: {} };
 
   for (const name of RUN) {
-    const { tail, params } = PRESETS[name];
+    const { tail, head, params } = PRESETS[name];
     try {
-      const run = await measure(buildPrompt(q, results, tail), params);
+      const run = await measure(buildPrompt(q, results, tail, head), params);
       row.runs[name] = { ...run, ...grade({ expect, must, text: run.text, contextIds }) };
     } catch (err) {
       row.runs[name] = { error: String(err.message).slice(0, 200) };
@@ -514,6 +538,9 @@ for (const name of RUN) {
     지어냄_함정오답: count("지어냄"),
     빈답변: count("빈답변"),
     없는조항_지어냄: rs.filter((r) => r.invented?.length).length,
+    // 제대로 답해놓고 끝에 "규칙집에서 찾지 못했습니다"를 습관처럼 붙인 답.
+    // 틀린 답은 아니라 정확도에는 안 잡히지만 읽는 사람을 헷갈리게 한다.
+    찾지못함_덧붙임: rs.filter((r) => r.text && !isRefusal(r.text) && /찾지 못했/.test(r.text)).length,
     컨텍스트밖_인용: rs.filter((r) => r.outside?.length).length,
     "끊기지 않고 답변 완료": done.length,
     "20초 안에 첫 글자 표시": shown.length,
@@ -543,6 +570,7 @@ for (const name of RUN) {
   console.log(`  ${width("틀림 - 검색 탓", 26)}: ${summary.검색실패_검색탓}`);
   console.log(`  ${width("없는 조항 번호 지어냄", 26)}: ${summary.없는조항_지어냄}`);
   console.log(`  ${width("안 넘긴 조항 끌어다 씀", 26)}: ${summary.컨텍스트밖_인용}`);
+  console.log(`  ${width("답 끝에 찾지 못함 덧붙임", 26)}: ${summary.찾지못함_덧붙임}`);
   console.log(`  ── 속도 ──`);
   for (const k of ["끊기지 않고 답변 완료", "20초 안에 첫 글자 표시", "끊김 - 글이 3초 멈춤", "끊김 - 토큰 한도", "완료된 것의 평균 시간(초)", "첫 글자까지 평균(초)", "조각 사이 최대 공백(초)", "평균 답변 길이(자)"]) {
     const suffix = k.includes("(") ? "" : `/${summary.문항}`;
