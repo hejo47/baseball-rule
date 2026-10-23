@@ -411,7 +411,7 @@ export default function Home() {
               KBO 규칙 검색기
             </h1>
             <p className="mt-0.5 text-xs text-zinc-600 dark:text-zinc-400">
-              KBO 공식 야구규칙과 KBO 리그 규정에서 찾아 답합니다.
+              KBO 공식 야구규칙, 리그 규정, 규약에서 찾아 답합니다.
             </p>
           </div>
           <button

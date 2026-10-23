@@ -49,6 +49,7 @@ const LIMIT = limitAt === -1 ? Infinity : Number(args[limitAt + 1]);
 const docs = [
   ...JSON.parse(await readFile(new URL("../data/rules.json", import.meta.url), "utf8")),
   ...JSON.parse(await readFile(new URL("../data/league.json", import.meta.url), "utf8")),
+  ...JSON.parse(await readFile(new URL("../data/bylaws.json", import.meta.url), "utf8")),
 ];
 
 /** 조항 원문의 지문. 원문이 바뀌면 설명을 다시 만든다. */

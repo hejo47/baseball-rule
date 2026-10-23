@@ -41,6 +41,7 @@ if (!process.env.NVIDIA_API_KEY) {
 const docs = [
   ...JSON.parse(await readFile(new URL("../data/rules.json", import.meta.url), "utf8")),
   ...JSON.parse(await readFile(new URL("../data/league.json", import.meta.url), "utf8")),
+  ...JSON.parse(await readFile(new URL("../data/bylaws.json", import.meta.url), "utf8")),
 ];
 
 /** 무료 API가 간헐적으로 502를 낸다. 몇 번 쉬었다 다시 걸어본다. */

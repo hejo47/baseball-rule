@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "KBO 규칙 검색기",
-  description: "KBO 공식 야구규칙과 KBO 리그 규정에서 찾아 답합니다.",
+  description: "KBO 공식 야구규칙, 리그 규정, 규약에서 찾아 답합니다.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

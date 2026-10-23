@@ -1,5 +1,6 @@
 import rules from "@/data/rules.json";
 import league from "@/data/league.json";
+import bylaws from "@/data/bylaws.json";
 import synonyms from "@/data/synonyms.json";
 import vectorFile from "@/data/vectors.json";
 import plain from "@/data/plain.json";
@@ -13,7 +14,7 @@ export interface RuleEntry {
   id: string;
   title: string;
   chapter: string;
-  /** "규칙" | "정의" | "리그규정" */
+  /** "규칙" | "정의" | "리그규정" | "규약" */
   type: string;
   /** 어느 문서에서 왔는지. 답변에서 근거 문서를 구분해 보여줄 때 쓴다. */
   source: string;
@@ -28,15 +29,33 @@ export interface SearchResult extends RuleEntry {
   plain?: string;
 }
 
-// 야구규칙과 리그 규정을 한 묶음으로 검색한다.
+// 야구규칙, 리그 규정, 규약을 한 묶음으로 검색한다.
 //
-// 두 문서는 다루는 범위가 겹치지 않는다. 야구규칙에는 비디오 판독, 피치클락,
+// 세 문서는 다루는 범위가 거의 겹치지 않는다. 야구규칙에는 비디오 판독, 피치클락,
 // 엔트리 같은 운영 규정이 아예 없어서 예전에는 "규칙집에서 찾지 못했습니다"로
-// 답할 수밖에 없었다.
+// 답할 수밖에 없었다. FA 자격, 선수 정원, 외국인선수 같은 선수 신분과 계약은
+// 규약에만 있다.
 //
 // data/vectors.json이 이 순서대로 만들어져 있다. 순서를 바꾸면
 // scripts/build-vectors.mjs도 같이 바꾸고 벡터를 다시 만들어야 한다.
-const DOCS = [...rules, ...league] as RuleEntry[];
+const DOCS = [...rules, ...league, ...bylaws] as RuleEntry[];
+
+// 분야. 경기(야구규칙 + 리그 규정)와 규약을 따로 색인하고, 질문이 어느 쪽에
+// 가까운지에 따라 가중치를 준다(domainWeights).
+//
+// 규약을 한 색인에 그냥 섞었을 때(261023) 조각이 457개에서 911개로 늘며 BM25의
+// 희귀도·평균 길이가 바뀌어, 규약과 상관없는 경기 질문 3개가 같은 경기 조각끼리
+// 순서가 섞여 밀렸다. 분야마다 따로 색인하면 경기 쪽 순위는 규약을 넣기 전과 같다.
+//
+// 야구규칙과 리그 규정은 한 분야로 둔다. 서로 엮인 곳이 많고("몸에 맞는 공"이
+// 리그 규정의 비디오 판독 대상 목록에도 있다) 지금까지 한 색인에서 문제가 없었다.
+const DOMAINS = [
+  { name: "경기", start: 0, end: rules.length + league.length },
+  { name: "규약", start: rules.length + league.length, end: DOCS.length },
+];
+const DOMAIN_OF = DOCS.map((_, i) =>
+  DOMAINS.findIndex((d) => i >= d.start && i < d.end),
+);
 
 interface Synonym {
   words: string[];
@@ -182,17 +201,32 @@ interface Index {
   body: Bm25Field;
 }
 
-let cached: Index | null = null;
+interface Indexes {
+  /** 분야마다 따로 만든 색인. 순위는 이걸로 매긴다. */
+  byDomain: Index[];
+  /**
+   * 분야를 가리지 않은 색인. 분야 판별의 글자 증거와, 질문 벡터가 없을 때 쓴다.
+   * 분야별 색인의 점수끼리는 비교할 수 없다. 규약에는 "주자" 같은 경기 말이 드물어
+   * 희귀도가 부풀려지기 때문이다.
+   */
+  all: Index;
+}
+
+let cached: Indexes | null = null;
 
 // 제목, 영문명, 본문(본문 + 사람 말 설명)을 따로 색인한다.
 // 각자의 문서 집합 안에서 흔한 말(idf)이 따로 계산돼, 제목만의 특징이 묻히지 않는다.
-function getIndex(): Index {
+function getIndex(): Indexes {
   if (!cached) {
     warnDeadSynonyms();
+    const build = (start: number, end: number): Index => ({
+      title: buildBm25(tokenFile.title.slice(start, end)),
+      english: buildBm25(tokenFile.english.slice(start, end)),
+      body: buildBm25(tokenFile.body.slice(start, end)),
+    });
     cached = {
-      title: buildBm25(tokenFile.title),
-      english: buildBm25(tokenFile.english),
-      body: buildBm25(tokenFile.body),
+      byDomain: DOMAINS.map(({ start, end }) => build(start, end)),
+      all: build(0, DOCS.length),
     };
   }
   return cached;
@@ -264,14 +298,38 @@ function expandQuery(query: string): string | null {
 // "닿다"도 같이 찾는다. 조항 쪽은 건드리지 않는다("규정에 맞게"처럼 다른 뜻도 있다).
 const SAME_MEANING: Record<string, string[]> = { 맞다: ["닿다"] };
 
-function lexicalScores(query: string): number[] {
-  const { title, english, body } = getIndex();
+// 묻는 말투에서만 나오는 형태소는 질문 쪽에서 버린다. 조항에는 거의 안 나와서
+// BM25가 드문 말로 보고 큰 점수를 주는데, 무엇을 묻는지와 상관이 없다.
+// "몇"은 조항 1개, "돼"를 잘못 자른 "돼다"는 4개에만 있어, "승부조작하면 어떻게
+// 돼?"에서 '돼다'가 든 규칙 조항이 '승부조작'이 든 규약 조항보다 높았다(261023).
+//
+// "하다", "되다", "있다", "수"는 반대로 거의 모든 조항에 있어 BM25 점수는 작지만,
+// 제목 칸은 그 질문의 최고점으로 나누기 때문에 다른 말이 제목에 안 걸리면 제목에
+// "하다"가 든 조항이 제목 칸 1.0을 받는다. "승부조작하면"이 승부조작 + 하다로 잘려
+// 제목에 '하다'가 든 경기 조항들이 본문에 '승부조작'이 든 규약 조항을 이겼다.
+const QUESTION_WORDS = new Set([
+  "돼다", "어떻다", "몇", "얼마", "언제", "뭐",
+  "하다", "되다", "있다", "수",
+]);
+
+// byDomain: 분야별 색인으로 매기고 분야마다 최고점으로 나눈다.
+//           false면 분야를 가리지 않은 색인으로 매기고 전체 최고점으로 나눈다.
+function lexicalScores(query: string, byDomain: boolean): number[] {
+  const index = getIndex();
   const words = [
-    ...new Set(tokenize(query).flatMap((w) => [w, ...(SAME_MEANING[w] ?? [])])),
+    ...new Set(
+      tokenize(query)
+        .filter((w) => !QUESTION_WORDS.has(w))
+        .flatMap((w) => [w, ...(SAME_MEANING[w] ?? [])]),
+    ),
   ];
-  const titleScores = normalized(bm25Scores(title, words));
-  const englishScores = normalized(bm25Scores(english, words));
-  const bodyScores = normalized(bm25Scores(body, words));
+  const field = (pick: (i: Index) => Bm25Field) =>
+    byDomain
+      ? normalizedByDomain(index.byDomain.flatMap((i) => bm25Scores(pick(i), words)))
+      : normalized(bm25Scores(pick(index.all), words));
+  const titleScores = field((i) => i.title);
+  const englishScores = field((i) => i.english);
+  const bodyScores = field((i) => i.body);
   return DOCS.map(
     (_, i) =>
       Math.max(titleScores[i], englishScores[i]) * TITLE_WEIGHT +
@@ -280,15 +338,15 @@ function lexicalScores(query: string): number[] {
 }
 
 /** 글자가 얼마나 겹치는지로만 매긴 점수. 사전 확장까지 마친 결과다. */
-function lexicalWithSynonyms(query: string): number[] {
-  const scores = lexicalScores(query);
+function lexicalWithSynonyms(query: string, byDomain: boolean): number[] {
+  const scores = lexicalScores(query, byDomain);
 
   // 확장한 질문은 따로 채점해 더 높은 쪽을 쓴다. 원래 질문 뒤에 붙이면
   // 확장어(흔한 말이 섞이기 쉽다)가 원래 질문의 비중을 깎아, 이미 잘 찾던
   // 질문까지 밀려났다. ("주루방해" 6등 -> 16등)
   const expanded = expandQuery(query);
   if (expanded) {
-    const expandedScores = lexicalScores(expanded);
+    const expandedScores = lexicalScores(expanded, byDomain);
     for (let i = 0; i < scores.length; i++) {
       scores[i] = Math.max(scores[i], expandedScores[i]);
     }
@@ -300,22 +358,76 @@ function lexicalWithSynonyms(query: string): number[] {
  * 질문 벡터와 각 조각 벡터의 코사인 유사도. 벡터가 이미 길이 1이라 내적이다.
  * 사람 말 설명이 있는 조항은 원문과 설명 중 질문에 더 가까운 쪽을 쓴다.
  */
-function semanticScores(queryVector: number[]): number[] {
-  const norm = Math.sqrt(queryVector.reduce((sum, v) => sum + v * v, 0));
-  if (norm === 0) return DOC_VECTORS.map(() => 0);
-  const unit = queryVector.map((v) => v / norm);
-  const dot = (vector: number[]) => {
-    let sum = 0;
-    for (let i = 0; i < unit.length; i++) sum += unit[i] * vector[i];
-    return sum;
-  };
+function toUnit(vector: number[]): number[] | null {
+  const norm = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
+  return norm === 0 ? null : vector.map((v) => v / norm);
+}
 
+function dot(a: number[], b: number[]): number {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += a[i] * b[i];
+  return sum;
+}
+
+function semanticScores(unit: number[]): number[] {
   return DOC_VECTORS.map((docVector, i) => {
     const plainVector = PLAIN_VECTORS.get(DOCS[i].id)?.vector;
     return plainVector
-      ? Math.max(dot(docVector), dot(plainVector))
-      : dot(docVector);
+      ? Math.max(dot(unit, docVector), dot(unit, plainVector))
+      : dot(unit, docVector);
   });
+}
+
+// 질문이 어느 분야에 가까운지는 뜻과 글자 두 증거를 반반 섞어 정한다.
+// 둘 다 이미 계산한 것을 다시 쓰므로 API를 더 타지 않는다.
+//
+// 분야 하나만 검색하지 않고 둘 다 검색한 뒤 먼 쪽 점수를 깎는다. 판별이 틀렸을 때
+// 정답이 아예 사라지면 안 된다. 경계에 걸친 질문("외국인 선수도 비디오 판독 신청할
+// 수 있어?", "부상자 명단에 올리면 며칠 뒤에 돌아와?")은 실제로 판별이 갈린다.
+//
+// 뜻: 질문 벡터를 분야별 평균 벡터(중심)와 비교한다. (규약 중심과의 유사도 - 경기
+// 중심과의 유사도)는 시험 46문항에서 경기 질문이 -0.32~-0.004, 규약 질문이
+// +0.02~+0.08로 갈렸다(261023). 그 사이에 걸치는 질문은 둘 다 거의 그대로 두고,
+// 멀어질수록 먼 쪽을 깎는다.
+//
+// 글자: 분야를 가리지 않은 글자 검색 상위 5개 중 규약 조각의 비율. 뜻만 보면
+// "승부조작하면 어떻게 돼?"가 경기 쪽(-0.07)으로 판별돼, 규약 제148조(부정행위)에
+// 글자 그대로 있는 말인데도 반칙 조항만 나왔다. 그 분야에만 있는 말이 질문에 있으면
+// 글자 쪽이 잡는다.
+const DOMAIN_MIDPOINT = 0.005;
+const DOMAIN_SPREAD = 0.015;
+const LEXICAL_VOTES = 5;
+// 확실할 때 먼 쪽 분야에 남기는 가중치. 0이면 그 분야를 아예 버린다.
+const OTHER_DOMAIN_FLOOR = 0.3;
+
+let centroids: number[][] | null = null;
+
+function domainWeights(unit: number[], lettersAll: number[]): number[] {
+  if (!centroids) {
+    centroids = DOMAINS.map(({ start, end }) => {
+      const vectors = DOC_VECTORS.slice(start, end);
+      const sum = vectors[0].map((_, j) => vectors.reduce((s, v) => s + v[j], 0));
+      return toUnit(sum) ?? sum;
+    });
+  }
+  const [game, bylaw] = centroids.map((c) => dot(unit, c));
+  const byMeaning = 1 / (1 + Math.exp(-(bylaw - game - DOMAIN_MIDPOINT) / DOMAIN_SPREAD));
+
+  const top = lettersAll
+    .map((score, i) => ({ score, i }))
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, LEXICAL_VOTES);
+  const byLetters = top.length
+    ? top.filter((s) => DOMAIN_OF[s.i] === 1).length / top.length
+    : byMeaning;
+
+  const pBylaw = (byMeaning + byLetters) / 2;
+  const likelihood = [1 - pBylaw, pBylaw];
+  const best = Math.max(...likelihood);
+  return likelihood.map(
+    (p) => OTHER_DOMAIN_FLOOR + (1 - OTHER_DOMAIN_FLOOR) * (p / best),
+  );
 }
 
 // 두 점수는 눈금이 다르다. 글자 점수는 0.05~0.87, 뜻 점수는 0.07~0.58로
@@ -324,6 +436,11 @@ function semanticScores(queryVector: number[]): number[] {
 function normalized(scores: number[]): number[] {
   const max = Math.max(...scores);
   return max > 0 ? scores.map((s) => s / max) : scores;
+}
+
+// 분야마다 따로 최댓값으로 나눈다. 분야 사이의 비중은 domainWeights가 정한다.
+function normalizedByDomain(scores: number[]): number[] {
+  return DOMAINS.flatMap(({ start, end }) => normalized(scores.slice(start, end)));
 }
 
 function rank(scores: number[], topK?: number): SearchResult[] {
@@ -342,9 +459,12 @@ function rank(scores: number[], topK?: number): SearchResult[] {
 /**
  * 글자 검색만으로 순위를 매긴다. 외부 호출이 없어 즉시 끝난다.
  * 뜻 검색을 쓸 수 없을 때(키 없음, API 실패) 이걸로 답한다.
+ *
+ * 질문 벡터가 없어 분야를 판별할 수 없으므로 분야를 가리지 않고 전체에서
+ * 최댓값을 찾아 나눈다.
  */
 export function searchByLetters(query: string, topK?: number): SearchResult[] {
-  return rank(lexicalWithSynonyms(query), topK);
+  return rank(lexicalWithSynonyms(query, false), topK);
 }
 
 /**
@@ -381,15 +501,17 @@ export async function search(
   query: string,
   topK?: number,
 ): Promise<SearchResult[]> {
-  const letters = lexicalWithSynonyms(query);
-
   const queryVector = await embedQuery(query);
-  if (!queryVector) return rank(letters, topK);
+  const unit = queryVector && toUnit(queryVector);
+  if (!unit) return searchByLetters(query, topK);
 
-  const meaning = normalized(semanticScores(queryVector));
-  const byLetters = normalized(letters);
+  const meaning = normalizedByDomain(semanticScores(unit));
+  const byLetters = normalizedByDomain(lexicalWithSynonyms(query, true));
+  const weights = domainWeights(unit, lexicalWithSynonyms(query, false));
   const blended = byLetters.map(
-    (s, i) => s * (1 - EMBEDDING_WEIGHT) + meaning[i] * EMBEDDING_WEIGHT,
+    (s, i) =>
+      (s * (1 - EMBEDDING_WEIGHT) + meaning[i] * EMBEDDING_WEIGHT) *
+      weights[DOMAIN_OF[i]],
   );
 
   return rank(blended, topK);
