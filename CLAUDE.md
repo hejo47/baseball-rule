@@ -10,4 +10,5 @@
 ## 이어서 작업할 때
 
 - 할 일과 순서는 `docs/todo.md`, 검색 기록은 `docs/search.md`, 답변 모델 기록은 `docs/answer.md`.
+- 지난 작업 세션의 요약은 `docs/sessions/`(날짜별).
 - `.env.local`(`NVIDIA_API_KEY`)은 저장소에 없다. 컴퓨터마다 따로 만든다.
