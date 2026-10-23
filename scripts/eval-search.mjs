@@ -19,7 +19,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 const BASE = process.argv[2] ?? "http://localhost:3000";
 // 파일 이름에 남길 메모 (무엇을 바꾼 측정인지)
 const NOTE = process.argv[3] ?? "측정";
-// lib/llm.ts의 CONTEXT_LIMIT과 같은 값이어야 한다.
+// lib/search.ts의 CONTEXT_LIMIT과 같은 값이어야 한다.
 const CONTEXT_LIMIT = 8;
 
 const testset = JSON.parse(
@@ -38,27 +38,39 @@ async function searchApi(message, history = []) {
 
 let top1 = 0;
 let inContext = 0;
+let viaDefinition = 0;
 let missing = 0;
+let attachedCount = 0;
 const rows = [];
 
 for (const { q, expect, level, history = [] } of testset) {
   // 앞 대화가 붙은 문항(이어지는 질문)은 앱처럼 앞 대화와 같이 검색한다.
   const results = await searchApi(q, history);
+  // lib/search.ts는 상위 CONTEXT_LIMIT개 바로 뒤에 함께 넘길 용어 정의를 끼워 넣는다
+  // (definitionFor가 붙은 것). 순위는 그걸 빼고 매겨, 정의를 붙이기 전과 같은 눈금으로 본다.
+  const attached = results.filter((r) => r.definitionFor);
+  const ranked = results.filter((r) => !r.definitionFor);
+  attachedCount += attached.length;
   const ranks = expect.map((id) => {
-    const i = results.findIndex((r) => r.id === id);
+    const i = ranked.findIndex((r) => r.id === id);
     return i === -1 ? Infinity : i + 1;
   });
   const best = ranks.length ? Math.min(...ranks) : null;
+  const attachedIds = attached.map((r) => `${r.id}(${r.definitionFor})`);
 
   // 함정 문제: 정답 조항이 없는 게 정답이라 순위 채점에서 제외한다.
   if (best === null) {
-    rows.push({ q, expect, level, rank: "-", status: "함정(정답 없음)" });
+    rows.push({ q, expect, level, rank: "-", status: "함정(정답 없음)", attached: attachedIds });
     continue;
   }
 
+  // 순위로는 밀렸지만 용어 정의로 함께 넘어간 경우
+  const asDefinition = best > CONTEXT_LIMIT && attached.some((r) => expect.includes(r.id));
+
   if (best === 1) top1++;
   if (best <= CONTEXT_LIMIT) inContext++;
-  if (best === Infinity) missing++;
+  if (asDefinition) viaDefinition++;
+  if (best === Infinity && !asDefinition) missing++;
 
   rows.push({
     q,
@@ -69,9 +81,12 @@ for (const { q, expect, level, history = [] } of testset) {
         ? "1등"
         : best <= CONTEXT_LIMIT
           ? `상위 ${CONTEXT_LIMIT}개 안`
-          : best === Infinity
-            ? "검색 실패"
-            : "밀려남",
+          : asDefinition
+            ? "정의로 함께 넘어감"
+            : best === Infinity
+              ? "검색 실패"
+              : "밀려남",
+    attached: attachedIds,
   });
 }
 
@@ -82,13 +97,18 @@ console.log(`대상: ${BASE}\n`);
 console.log(pad("질문", 34), pad("난이도", 8), pad("순위", 6), "상태");
 console.log("-".repeat(74));
 for (const r of rows) {
-  console.log(pad(r.q, 34), pad(r.level ?? "", 8), pad(r.rank, 6), r.status);
+  const extra = r.attached.length ? `  + 정의 ${r.attached.join(", ")}` : "";
+  console.log(pad(r.q, 34), pad(r.level ?? "", 8), pad(r.rank, 6), r.status + extra);
 }
+const inView = inContext + viaDefinition;
 console.log("-".repeat(74));
 console.log(`채점 대상            : ${scored}문제`);
 console.log(`1등으로 찾음         : ${top1}/${scored} (${((top1 / scored) * 100).toFixed(0)}%)`);
-console.log(`상위 ${CONTEXT_LIMIT}개 안에 들어옴   : ${inContext}/${scored} (${((inContext / scored) * 100).toFixed(0)}%)  <- LLM이 볼 수 있는 범위`);
+console.log(`상위 ${CONTEXT_LIMIT}개 안에 들어옴   : ${inContext}/${scored} (${((inContext / scored) * 100).toFixed(0)}%)`);
+console.log(`정의로 함께 넘어감   : ${viaDefinition}/${scored}`);
+console.log(`AI가 보는 범위 안    : ${inView}/${scored} (${((inView / scored) * 100).toFixed(0)}%)  <- 상위 ${CONTEXT_LIMIT}개 + 함께 넘긴 정의`);
 console.log(`아예 못 찾음         : ${missing}/${scored}`);
+console.log(`함께 넘긴 정의       : ${attachedCount}개 (${testset.length}문항, 문항당 ${(attachedCount / testset.length).toFixed(1)}개)`);
 
 // 조항을 몇 개까지 LLM에 넘길지 정할 때 쓰는 표.
 const ranked = rows.filter((r) => r.rank !== "-").map((r) => (r.rank === "없음" ? Infinity : r.rank));
@@ -105,6 +125,6 @@ const name = `search-${NOTE}-${stamp}.json`;
 await mkdir(new URL("../results/", import.meta.url), { recursive: true });
 await writeFile(
   new URL(`../results/${name}`, import.meta.url),
-  JSON.stringify({ base: BASE, note: NOTE, contextLimit: CONTEXT_LIMIT, scored, top1, inContext, missing, recall, rows }, null, 2),
+  JSON.stringify({ base: BASE, note: NOTE, contextLimit: CONTEXT_LIMIT, scored, top1, inContext, viaDefinition, inView, missing, attachedCount, recall, rows }, null, 2),
 );
 console.log(`\n결과 저장: results/${name}`);

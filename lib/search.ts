@@ -27,6 +27,20 @@ export interface SearchResult extends RuleEntry {
   score: number;
   /** data/plain.json에 적어둔 사람 말 설명. 있는 조항만 붙는다. */
   plain?: string;
+  /**
+   * 순위로는 AI에게 넘어가지 않지만, 넘기는 조항에 나오는 용어의 정의라서
+   * 함께 넘기는 조각이면 그 조항 번호. 상위 CONTEXT_LIMIT개 바로 뒤에 온다.
+   */
+  definitionFor?: string;
+}
+
+// AI에게 넘기는 조항 개수. 이 뒤에 용어 정의가 최대 MAX_DEFINITIONS개 더 붙는다.
+// 조항 하나가 2,500자까지 되므로 너무 많이 넘기면 응답이 크게 느려진다.
+export const CONTEXT_LIMIT = 8;
+
+/** AI에게 넘기는 조각: 상위 CONTEXT_LIMIT개와 함께 넘기는 용어 정의. */
+export function contextOf(results: SearchResult[]): SearchResult[] {
+  return results.filter((r, i) => i < CONTEXT_LIMIT || r.definitionFor);
 }
 
 // 야구규칙, 리그 규정, 규약을 한 묶음으로 검색한다.
@@ -430,6 +444,86 @@ function domainWeights(unit: number[], lettersAll: number[]): number[] {
   );
 }
 
+// 넘기는 조항에 규칙집이 정의한 용어가 나오면 그 정의를 함께 넘긴다(261023).
+//
+// "포스아웃 상황에서 공은 완전히 잡았는데 공이 땅에 닿아 있으면 아웃인가?"의 답은
+// 5.09⒝⑹(베이스에 태그하면 포스 아웃)과 정의-75(태그 = 확실하게 공을 잡고 베이스에
+// 대는 것)를 이어야 나온다. 조항은 '태그'라고만 쓰고 정의는 30위 밖이라, 모델은
+// 플라이 포구의 "지면에 닿기 전" 조건을 끌어와 틀렸다. 질문마다 사람 말 설명을
+// 붙이는 대신, 조항이 쓰는 용어의 정의가 같이 가게 한다.
+//
+// - 후보: 상위 DEFINITION_SOURCE_CLAUSES개 조항에 나오는 용어의 정의. 한 글자 용어
+//   ("볼", "루")는 다른 말 속에 섞여 빼고, COMMON_TERM_MAX_DOCS개 넘는 조항에 나오는
+//   흔한 용어("타자", "주자", "아웃")도 뺀다. 그냥 붙이면 매번 "투수란…"이 따라온다.
+// - 고르기: 질문과 뜻이 가까운 순, DEFINITION_MIN_SIMILARITY 이상만. 조항에 많이
+//   나오는 순으로 고르면 49문항 중 거의 전부에 "번트", "덕아웃" 같은 엉뚱한 정의가
+//   붙었다. 문턱 0.33은 관련 있는 정의(0.34~0.53)와 잡음(0.32 이하)을 시험 문항에서
+//   눈으로 보고 정했다.
+const DEFINITION_SOURCE_CLAUSES = 3;
+const COMMON_TERM_MAX_DOCS = 60;
+const DEFINITION_MIN_SIMILARITY = 0.33;
+const MAX_DEFINITIONS = 2;
+
+interface Definition {
+  index: number;
+  terms: string[];
+}
+
+let definitions: Definition[] | null = null;
+
+function getDefinitions(): Definition[] {
+  if (!definitions) {
+    const bodies = DOCS.filter((doc) => doc.type !== "정의").map((doc) =>
+      normalize(`${doc.title}${doc.text}`),
+    );
+    definitions = DOCS.flatMap((doc, index) => {
+      if (doc.type !== "정의") return [];
+      // "캐치·포구" -> 포구, "벤치 또는 덕아웃" -> 벤치, 덕아웃
+      const terms = doc.title
+        .split(/·|또는|\//)
+        .map(normalize)
+        .filter((term) => /[가-힣]/.test(term) && term.length >= 2)
+        .filter((term) => {
+          const count = bodies.filter((body) => body.includes(term)).length;
+          return count > 0 && count <= COMMON_TERM_MAX_DOCS;
+        });
+      return terms.length ? [{ index, terms }] : [];
+    });
+  }
+  return definitions;
+}
+
+function withDefinitions(ranked: SearchResult[], unit: number[]): SearchResult[] {
+  const context = ranked.slice(0, CONTEXT_LIMIT);
+  const shown = new Set(context.map((r) => r.id));
+  const sources = context
+    .slice(0, DEFINITION_SOURCE_CLAUSES)
+    .map((r) => ({ id: r.id, text: normalize(`${r.title}${r.text}`) }));
+
+  const picked = getDefinitions()
+    .filter(({ index }) => !shown.has(DOCS[index].id))
+    .map(({ index, terms }) => ({
+      index,
+      source: sources.find((s) => terms.some((term) => s.text.includes(term))),
+      similarity: dot(unit, DOC_VECTORS[index]),
+    }))
+    .filter((d) => d.source && d.similarity >= DEFINITION_MIN_SIMILARITY)
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, MAX_DEFINITIONS);
+  if (picked.length === 0) return ranked;
+
+  const attached: SearchResult[] = picked.map(({ index, source }) => {
+    const found = ranked.find((r) => r.id === DOCS[index].id);
+    return { ...(found ?? { ...DOCS[index], score: 0 }), definitionFor: source!.id };
+  });
+  const moved = new Set(attached.map((r) => r.id));
+  return [
+    ...context,
+    ...attached,
+    ...ranked.slice(CONTEXT_LIMIT).filter((r) => !moved.has(r.id)),
+  ];
+}
+
 // 두 점수는 눈금이 다르다. 글자 점수는 0.05~0.87, 뜻 점수는 0.07~0.58로
 // 나온다. 그냥 더하면 글자 쪽이 일방적으로 이기므로 각자 그 질문에서의
 // 최댓값으로 나눠 0~1로 맞춘 뒤 섞는다.
@@ -514,5 +608,6 @@ export async function search(
       weights[DOMAIN_OF[i]],
   );
 
-  return rank(blended, topK);
+  const results = withDefinitions(rank(blended), unit);
+  return topK === undefined ? results : results.slice(0, topK);
 }

@@ -313,8 +313,12 @@ export default function Home() {
         body: JSON.stringify({
           question: turn.question,
           answer: turn.answer,
-          // /api/chat이 AI에게 넘기는 개수(lib/llm.ts의 CONTEXT_LIMIT)와 같다.
-          contextIds: (turn.results ?? []).slice(0, 8).map((r) => r.id),
+          // /api/chat이 AI에게 넘기는 것과 같다(lib/search.ts의 contextOf: 상위 8개와
+          // 함께 넘긴 용어 정의). 그 함수를 가져오면 벡터 파일까지 브라우저로 딸려 와서
+          // 같은 조건을 여기 쓴다.
+          contextIds: (turn.results ?? [])
+            .filter((r, i) => i < 8 || r.definitionFor)
+            .map((r) => r.id),
         }),
       });
       patch(turn.id, { reported: res.ok ? "done" : "failed" });

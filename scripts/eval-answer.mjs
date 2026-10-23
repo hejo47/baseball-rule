@@ -26,7 +26,7 @@ const BASE = process.env.EVAL_BASE ?? "http://localhost:3000";
 // 글이 계속 나오는 동안에는 앱처럼 전체 시간을 제한하지 않는다.
 const FIRST_TEXT_MS = 20_000;
 const STALL_MS = 3_000;
-// lib/llm.ts의 CONTEXT_LIMIT과 같은 값이어야 한다.
+// lib/search.ts의 CONTEXT_LIMIT과 같은 값이어야 한다.
 // --context N 으로 덮어써서 "조항을 몇 개 넘기는 게 좋은가"를 실험할 수 있다.
 const DEFAULT_CONTEXT_LIMIT = 8;
 
@@ -428,14 +428,22 @@ ${turns}
 `;
 }
 
+// lib/search.ts의 contextOf와 같다. 상위 CONTEXT_LIMIT개 뒤에 함께 넘길 용어 정의가
+// 끼어 온다(definitionFor). --context로 개수를 바꿔 잴 때도 정의는 그대로 따라간다.
+function contextOf(results) {
+  const ranked = results.filter((r) => !r.definitionFor).slice(0, CONTEXT_LIMIT);
+  return [...ranked, ...results.filter((r) => r.definitionFor)];
+}
+
 function buildPrompt(question, results, tail, head = DEFAULT_HEAD, history = []) {
-  const shown = results.slice(0, CONTEXT_LIMIT);
+  const shown = contextOf(results);
   const context = shown
-    // lib/llm.ts와 같게 사람 말 설명(data/plain.json)을 같이 준다.
+    // lib/llm.ts와 같게 사람 말 설명(data/plain.json)과 정의 표시를 같이 준다.
     .map(
       (r) =>
         `[${r.id}] ${r.title} (${r.source})\n${r.text}` +
-        (r.plain ? `\n(쉬운 설명, 규칙집 원문 아님: ${r.plain})` : ""),
+        (r.plain ? `\n(쉬운 설명, 규칙집 원문 아님: ${r.plain})` : "") +
+        (r.definitionFor ? `\n(위 [${r.definitionFor}]에 나오는 용어의 정의)` : ""),
     )
     .join("\n\n---\n\n");
 
@@ -554,7 +562,7 @@ if (REGRADE) {
 for (const { q, expect, level, must = [], clarify = false, history = [] } of questions) {
   // 앞 대화가 붙은 문항(이어지는 질문)은 앱처럼 앞 대화와 같이 검색하고 묻는다.
   const results = await searchApi(q, history);
-  const contextIds = results.slice(0, CONTEXT_LIMIT).map((r) => r.id);
+  const contextIds = contextOf(results).map((r) => r.id);
   const row = { q, level, expect, must: must.map((m) => m.name), contextIds, runs: {} };
 
   for (const name of RUN) {

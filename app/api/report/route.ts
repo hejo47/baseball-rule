@@ -28,7 +28,8 @@ function parse(body: unknown): Report | null {
     question: question.trim().slice(0, MAX_QUESTION),
     answer: answer.trim().slice(0, MAX_ANSWER),
     contextIds: Array.isArray(contextIds)
-      ? contextIds.filter((id): id is string => typeof id === "string").slice(0, 8)
+      ? // 상위 8개 + 함께 넘긴 용어 정의 최대 2개 (lib/search.ts)
+        contextIds.filter((id): id is string => typeof id === "string").slice(0, 10)
       : [],
   };
 }

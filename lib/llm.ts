@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import type { SearchResult } from "@/lib/search";
+import { contextOf, type SearchResult } from "@/lib/search";
 import type { PreviousTurn } from "@/lib/conversation";
 import { CLARIFY_PREFIX } from "@/lib/clarify";
 
@@ -14,8 +14,6 @@ import { CLARIFY_PREFIX } from "@/lib/clarify";
 const MODEL = process.env.NVIDIA_MODEL ?? "openai/gpt-oss-20b";
 /** 틀린 답 신고에 어느 모델의 답이었는지 같이 적는다. */
 export const ANSWER_MODEL = MODEL;
-// 조항 하나가 2,500자까지 되므로 너무 많이 넘기면 응답이 크게 느려진다.
-const CONTEXT_LIMIT = 8;
 // 추론 + 답변을 합친 상한. reasoning_effort를 낮추면 실제로는 200~300토큰이면
 // 끝나므로, 이 값은 모델이 폭주할 때만 걸리는 안전장치다.
 const MAX_TOKENS = 900;
@@ -99,15 +97,16 @@ function buildPrompt(
   results: SearchResult[],
   history: PreviousTurn[],
 ): string {
-  const context = results
-    .slice(0, CONTEXT_LIMIT)
+  // 상위 조항 뒤에 그 조항들이 쓰는 용어의 정의가 붙어 온다(lib/search.ts).
+  const context = contextOf(results)
     // 사람 말 설명도 같이 준다. 5.09⒝⑸는 "플라이 볼이 포구된 뒤"라고만 적혀
     // 있어, 조항을 넘겨받고도 라인드라이브 질문에 "찾지 못했습니다"만 3/3번
     // 답했다. 설명을 같이 주자 3/3번 이 조항을 근거로 들었다(260929).
     .map(
       (r) =>
         `[${r.id}] ${r.title} (${r.source})\n${r.text}` +
-        (r.plain ? `\n(쉬운 설명, 규칙집 원문 아님: ${r.plain})` : ""),
+        (r.plain ? `\n(쉬운 설명, 규칙집 원문 아님: ${r.plain})` : "") +
+        (r.definitionFor ? `\n(위 [${r.definitionFor}]에 나오는 용어의 정의)` : ""),
     )
     .join("\n\n---\n\n");
 
