@@ -197,10 +197,76 @@ def split_long(article: dict, level: int = 0) -> list[dict]:
         piece = {
             **{k: v for k, v in article.items() if k != "text"},
             "id": f"{article['id']}{p['marker']}",
+            "title": with_item_label(article["title"], p["lines"][0]),
             "text": (intro + "\n\n" if intro else "") + p["marker"] + " " + body,
         }
         out.extend(split_long(piece, level + 1))
     return out or [article]
+
+
+# 쪼갠 조각의 제목에 붙이는 항목 머리말의 최대 길이. 넘으면 낱말 경계에서 자른다.
+LABEL_CHARS = 30
+TITLE_JOIN = " · "
+
+
+def item_label(first_line: str) -> str:
+    """하위 항목의 첫 줄을 제목에 붙일 머리말로 줄인다.
+
+    '⒝ 주자 아웃'처럼 짧은 소제목은 그대로, '⑸ 페어 플라이 볼, 파울 플라이 볼이
+    정규로 포구된 뒤 ...'처럼 본문이 바로 시작하면 앞부분만 쓴다.
+    """
+    line = re.sub(r"\s+", " ", first_line).strip()
+    if len(line) <= LABEL_CHARS:
+        return line
+    cut = line[:LABEL_CHARS]
+    if " " in cut:
+        cut = cut[:cut.rindex(" ")]
+    return cut.rstrip(",.·") + "…"
+
+
+def with_item_label(parent_title: str, first_line: str) -> str:
+    """쪼갠 조각의 제목 = 조항 제목 · 자기 항목의 머리말.
+
+    예전에는 쪼갠 조각이 부모 제목을 그대로 물려받아, 5.09에서 나온 조각
+    37개가 모두 '아웃'이었다(docs/search.md 한계 2).
+
+    중간 단계의 머리말은 붙이지 않는다. 부모 제목에 붙어 있던 머리말은 떼고 조항
+    제목만 쓴다. '5.09⒝⑸'를 '아웃 · 주자 아웃 · 페어 플라이...'로 이어 붙였더니
+    6.02⒜(보크) 아래 조각 13개가 모두 제목에 '보크'를 갖게 돼, '보크가 뭐야?'의
+    정답(정의-3)이 1등 -> 14등으로 밀렸다. 형제 조각끼리 같은 말을 나눠 쓰면 원래
+    문제가 다시 생긴다.
+    """
+    base = parent_title.split(TITLE_JOIN)[0]
+    label = item_label(first_line)
+    return f"{base}{TITLE_JOIN}{label}" if label else base
+
+
+def retitle(chunks: list[dict]) -> int:
+    """이미 만든 JSON의 쪼갠 조각에 항목 머리말 제목을 붙인다. 바꾼 개수를 돌려준다.
+
+    PDF 원문 없이 data/rules.json만 있을 때 쓴다. 조각 본문에 각 단계의 항목
+    줄('⒝ 주자 아웃', '⑸ 페어 ...')이 남아 있어서, split_long이 붙였을 것과 같은
+    제목을 다시 만들 수 있다. 여러 번 돌려도 결과가 같다.
+    """
+    changed = 0
+    for c in chunks:
+        m = re.match(r"^(\d{1,2}\.\d{2})(.+)$", c["id"])
+        if not m:
+            continue
+        title = c["title"].split(TITLE_JOIN)[0]
+        lines = c["text"].split("\n")
+        at = 0
+        for marker in m.group(2):
+            for i in range(at, len(lines)):
+                hit = re.match(rf"^\s*{re.escape(marker)}\s*(.*)$", lines[i])
+                if hit:
+                    title = with_item_label(title, hit.group(1))
+                    at = i + 1
+                    break
+        if title != c["title"]:
+            c["title"] = title
+            changed += 1
+    return changed
 
 
 def parse_definitions(text: str) -> list[dict]:
@@ -275,4 +341,14 @@ def main(src: str, dst: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    # python build_rules.py --retitle data/rules.json
+    #   PDF 없이 이미 만든 JSON의 쪼갠 조각 제목만 다시 붙인다.
+    if sys.argv[1] == "--retitle":
+        path = sys.argv[2]
+        chunks = json.load(open(path, encoding="utf-8"))
+        n = retitle(chunks)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(chunks, f, ensure_ascii=False, indent=2)
+        print(f"제목을 다시 붙인 조각 {n}개 -> {path}")
+    else:
+        main(sys.argv[1], sys.argv[2])

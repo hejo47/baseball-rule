@@ -13,6 +13,7 @@
  * 자세한 배경은 docs/search.md 참고.
  */
 import { readFile, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 const MODEL = process.env.NVIDIA_EMBED_MODEL ?? "nvidia/nemotron-3-embed-1b";
 // 한 번에 너무 많이 보내면 무료 API가 거부한다.
@@ -25,7 +26,8 @@ const MAX_CHARS = 1200;
 const PRECISION = 4;
 
 try {
-  process.loadEnvFile(new URL("../.env.local", import.meta.url).pathname);
+  // .pathname은 Windows에서 "/C:/..."에 한글이 %EC..로 남아 파일을 못 찾는다.
+  process.loadEnvFile(fileURLToPath(new URL("../.env.local", import.meta.url)));
 } catch {
   // 이미 환경변수로 넣어뒀다면 파일이 없어도 된다.
 }

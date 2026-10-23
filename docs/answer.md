@@ -331,5 +331,4 @@ nemotron-3-super는 대괄호로 적으라고 해도 네 번에 한 번꼴로 `(
   3개와 7개로 갈리기도 했다. 에러 난 문항은 채점에서 빠지므로 비교할 때는 **양쪽 다 답이
   나온 문항끼리** 비교한다.
 - Windows에서 한글 경로(`정리`)가 들어가면 `new URL(...).pathname`이 `%EC...`로 남아
-  파일을 못 찾는다. `fileURLToPath`를 쓴다. (`eval-answer.mjs`는 고쳤고
-  `build-vectors.mjs`에는 아직 남아 있다)
+  파일을 못 찾는다. `fileURLToPath`를 쓴다. (`eval-answer.mjs`, `build-vectors.mjs` 모두 고쳤다)

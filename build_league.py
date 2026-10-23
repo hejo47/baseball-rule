@@ -18,6 +18,9 @@ import json
 import re
 import sys
 
+# 쪼갠 조각의 제목에 항목 머리말을 붙이는 규칙은 야구규칙과 같게 쓴다.
+from build_rules import TITLE_JOIN, with_item_label
+
 TOC_PAGES = (7, 10)   # 목차 (쪽 번호, 양끝 포함)
 BODY_START_PAGE = 13  # 제1장 제1조가 시작하는 쪽 (앞은 표지·목차·변경요약)
 
@@ -155,10 +158,75 @@ def split_long(article: dict, level: int = 0) -> list[dict]:
         piece = {
             **{k: v for k, v in article.items() if k != "text"},
             "id": f"{article['id']}-{p['marker']}",
+            "title": with_item_label(article["title"], p["lines"][0]),
             "text": (intro + "\n\n" if intro else "") + p["marker"] + " " + body,
         }
         out.extend(split_long(piece, level + 1))
     return out or [article]
+
+
+def disambiguate(chunks: list[dict]) -> int:
+    """다른 장에 같은 이름으로 있는 조항은 제목에 장 이름을 붙인다. 바꾼 개수를 돌려준다.
+
+    '경기방식'은 정규시즌(제1조), 한국시리즈(제42조), 퓨처스리그(제59조) 등 6개 장에
+    따로 있고 내용도 다르다. 제목이 같으면 글자 점수를 똑같이 받아 질문이 어느
+    장을 묻는지 가리지 못한다. -> '경기방식 (KBO 한국시리즈)'
+    부록은 이름이 겹치지 않아 건드리지 않는다. 여러 번 돌려도 결과가 같다.
+    """
+    def base(c):
+        return c["title"].split(TITLE_JOIN)[0]
+
+    def chapter_name(c):
+        return re.sub(r"^제\s?\d+\s?장\s*", "", c["chapter"])
+
+    articles: dict[str, set[str]] = {}
+    for c in chunks:
+        m = re.match(r"^(리그-제\d+조)", c["id"])
+        if m:
+            name = re.sub(r" \([^)]*\)$", "", base(c))
+            articles.setdefault(name, set()).add(m.group(1))
+
+    changed = 0
+    for c in chunks:
+        if not c["id"].startswith("리그-제"):
+            continue
+        name = re.sub(r" \([^)]*\)$", "", base(c))
+        if len(articles.get(name, ())) < 2:
+            continue
+        rest = c["title"][len(base(c)):]
+        title = f"{name} ({chapter_name(c)}){rest}"
+        if title != c["title"]:
+            c["title"] = title
+            changed += 1
+    return changed
+
+
+def retitle(chunks: list[dict]) -> int:
+    """이미 만든 JSON의 쪼갠 조각에 항목 머리말 제목을 붙인다(build_rules.retitle과 같은 일).
+
+    리그 규정 조각 번호는 '리그-제28조-3', '리그-부록-KBO피치클락규정-1-①'처럼
+    '-' 뒤에 단계별 항목 번호가 붙는다. 본문에는 split_long이 '3 비디오 판독 ...'처럼
+    항목 번호 + 띄어쓰기로 남겨 두었다.
+    """
+    changed = 0
+    for c in chunks:
+        m = re.match(r"^(리그-제\d+조|리그-부록-[^-]+)((?:-[^-]+)+)$", c["id"])
+        if not m:
+            continue
+        title = c["title"].split(TITLE_JOIN)[0]
+        lines = c["text"].split("\n")
+        at = 0
+        for marker in m.group(2).split("-")[1:]:
+            for i in range(at, len(lines)):
+                hit = re.match(rf"^\s*{re.escape(marker)}\.?\s+(.*)$", lines[i])
+                if hit:
+                    title = with_item_label(title, hit.group(1))
+                    at = i + 1
+                    break
+        if title != c["title"]:
+            c["title"] = title
+            changed += 1
+    return changed
 
 
 def main(src: str, dst: str) -> None:
@@ -187,6 +255,7 @@ def main(src: str, dst: str) -> None:
     pieces = []
     for a in parsed:
         pieces.extend(split_long(a))
+    disambiguate(pieces)
 
     for p in pieces:
         p["chars"] = len(p["text"])
@@ -202,4 +271,14 @@ def main(src: str, dst: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    # python build_league.py --retitle data/league.json
+    #   PDF 없이 이미 만든 JSON의 쪼갠 조각 제목만 다시 붙인다.
+    if sys.argv[1] == "--retitle":
+        path = sys.argv[2]
+        chunks = json.load(open(path, encoding="utf-8"))
+        n = retitle(chunks) + disambiguate(chunks)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(chunks, f, ensure_ascii=False, indent=2)
+        print(f"제목을 다시 붙인 조각 {n}개 -> {path}")
+    else:
+        main(sys.argv[1], sys.argv[2])
