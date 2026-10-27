@@ -229,6 +229,56 @@ def retitle(chunks: list[dict]) -> int:
     return changed
 
 
+# PDF의 표를 글자로 뽑으면 칸 이름이 엉뚱한 줄에 섞인다. 고척돔 그라운드룰은
+# '파울지역', '내야 페어지역'이 ②번 줄 앞에 붙어, 모델이 "천장에 낀 공은 파울"을
+# 모든 경우의 규칙으로 읽었다(261027). 내용은 그대로 두고 칸별로 다시 적는다.
+# 바꿀 부분: 원문 첫 글자부터 END 표시까지. END는 바꾼 글에도 그대로 남는다.
+TABLE_FIXES = {
+    "리그-부록-고척스카이돔그라운드룰": {
+        "end": "* 내, 외야 페어지역 구분 – 천장 상단 3번째 통로(캣워크) 시작점",
+        "text": """구분: 적용 내용
+
+[파울지역]
+ ① 천장(스피커 등 포함)에 맞은 경우 → 파울
+ ② 천장(스피커 등 포함)에 낀 경우 → 파울
+ ③ 홈베이스 위쪽 천장에 낀 경우 → 파울
+
+[내야 페어지역]
+ ① 천장(스피커 등 포함)에 맞고 낙하한 볼을 포구 → 아웃
+ ② 천장(스피커 등 포함)에 낀 경우 → 볼 데드
+ (타자, 주자 → 안전진루권 2개루)
+ ③ 천장(스피커 등 포함)에 맞고 낙하한 볼을 포구하지 못했을 경우 → 인플레이
+
+[외야 페어지역]
+ 타구가 천장 상단 3번째 통로(캣워크) 시작점 이후 외야 페어지역 부터
+ 천장 또는 시설물(스피커, 홍보물 등)에 맞거나 낀 경우 → 홈런
+
+[기타]
+ 천장에 맞거나 낀 경우 등 확인이 필요한 판정에 대해서는 횟수와
+ 상관없이 비디오 판독 신청 가능
+
+ (2018.1.24 규칙위원회)
+""",
+    },
+}
+
+
+def fix_tables(chunks: list[dict]) -> int:
+    """TABLE_FIXES의 표를 칸별로 다시 적는다. 이미 고친 조각은 건너뛴다."""
+    changed = 0
+    for c in chunks:
+        fix = TABLE_FIXES.get(c["id"])
+        if not fix or c["text"].startswith(fix["text"]):
+            continue
+        at = c["text"].find(fix["end"])
+        if at < 0:
+            raise SystemExit(f"{c['id']}: 표 끝 표시를 못 찾았습니다. PDF가 바뀌었으면 TABLE_FIXES를 고치세요.")
+        c["text"] = fix["text"] + c["text"][at:]
+        c["chars"] = len(c["text"])
+        changed += 1
+    return changed
+
+
 def main(src: str, dst: str) -> None:
     raw = open(src, encoding="utf-8").read()
     pages = raw.split("\f")
@@ -256,6 +306,7 @@ def main(src: str, dst: str) -> None:
     for a in parsed:
         pieces.extend(split_long(a))
     disambiguate(pieces)
+    fix_tables(pieces)
 
     for p in pieces:
         p["chars"] = len(p["text"])
@@ -280,5 +331,14 @@ if __name__ == "__main__":
         with open(path, "w", encoding="utf-8") as f:
             json.dump(chunks, f, ensure_ascii=False, indent=2)
         print(f"제목을 다시 붙인 조각 {n}개 -> {path}")
+    elif sys.argv[1] == "--fix-tables":
+        # python build_league.py --fix-tables data/league.json
+        #   PDF 없이 이미 만든 JSON의 표만 칸별로 다시 적는다.
+        path = sys.argv[2]
+        chunks = json.load(open(path, encoding="utf-8"))
+        n = fix_tables(chunks)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(chunks, f, ensure_ascii=False, indent=2)
+        print(f"표를 다시 적은 조각 {n}개 -> {path}")
     else:
         main(sys.argv[1], sys.argv[2])
