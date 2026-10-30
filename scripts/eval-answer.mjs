@@ -181,6 +181,45 @@ PRESETS.근거먼저 = {
   params: PRESETS.결론먼저.params,
 };
 
+// 되묻기에 더해, 조항이 경우를 나눠 판정을 적어 두었으면 하나를 고르지 말고
+// 경우마다 쓰게 한다(261030). lib/llm.ts의 CASES_RULE, ASKS_CHOICE와 같아야 한다.
+// "돔 천장에 공이 끼이면 홈런인가 파울인가?"에 6번 중 5번 한쪽을 골랐다.
+// 처음엔 모든 상황형 질문에 걸었다가(경우나눔전체) 다른 문항이 나빠져서, 둘 중
+// 하나를 고르게 하는 질문에만 건다(경우나눔).
+const ASKS_CHOICE =
+  /(인가|인지|야|일까|냐|나)\??\s+\S{1,15}?(\s\S{1,10}?)?(인가|인지|야|일까|냐|나)\?|아니면/;
+const CASES_RULE =
+  '조항이 경우(위치, 상황)를 나눠 각각 판정을 적어 두었으면, 되묻지 말고 첫 문장에 "경우에 따라 다르다"고 써라.\n' +
+  '그다음 경우마다 조항에 적힌 판정을 그 말 그대로 써라. 질문이 "A인가 B인가"로 하나를 고르게 해도 하나만 고르지 마라.\n';
+PRESETS.경우나눔전체 = {
+  label: "경우나눔전체",
+  note: "되묻기 + 경우가 나뉘면 경우마다 (모든 상황형 질문)",
+  head: PRESETS.결론먼저.head,
+  tail: (ids, question) =>
+    (ASKS_TERM.test(question) && !ASKS_CASE.test(question)
+      ? TERM_TAIL
+      : CLARIFY_RULE +
+        CASES_RULE +
+        "첫 문장에 질문에 대한 결론을 써라. 예/아니오로 답할 수 있는 질문이면 예/아니오부터 말하라.\n" +
+        "그다음 그 결론의 근거를 설명하라. 결론과 다른 말로 끝내지 마라.\n" +
+        "3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.\n") + CITE_TAIL,
+  params: PRESETS.결론먼저.params,
+};
+PRESETS.경우나눔 = {
+  label: "경우나눔",
+  note: "되묻기 + 둘 중 하나를 묻는 질문에서 경우가 나뉘면 경우마다",
+  head: PRESETS.결론먼저.head,
+  tail: (ids, question) =>
+    (ASKS_TERM.test(question) && !ASKS_CASE.test(question)
+      ? TERM_TAIL
+      : CLARIFY_RULE +
+        (ASKS_CHOICE.test(question) ? CASES_RULE : "") +
+        "첫 문장에 질문에 대한 결론을 써라. 예/아니오로 답할 수 있는 질문이면 예/아니오부터 말하라.\n" +
+        "그다음 그 결론의 근거를 설명하라. 결론과 다른 말로 끝내지 마라.\n" +
+        "3~5문장으로 짧게 답하라. 표는 쓰지 말고 줄글로 쓴다.\n") + CITE_TAIL,
+  params: PRESETS.결론먼저.params,
+};
+
 // 프리셋이 head를 따로 주지 않으면 쓰는, 거부 문장 지시.
 const DEFAULT_HEAD = '조항에 없는 내용은 추측하지 말고 "규칙집에서 찾지 못했습니다"라고 답하라.';
 
