@@ -20,9 +20,6 @@ import {
 } from "./chat-history";
 import { readAsked, rememberAsked } from "./asked-history";
 
-// 목록에서 조항을 이만큼만 보여주고, 나머지는 "전체 보기"로 펼친다.
-const PREVIEW_CHARS = 300;
-
 // 입력창 높이. 한 줄이면 42px(글자 24px + 위아래 여백 16px + 테두리 2px)이고,
 // 길어지면 늘어나다가 INPUT_MAX_HEIGHT에서 멈춘다.
 const INPUT_MAX_HEIGHT = 100;
@@ -63,6 +60,16 @@ function findRule(cited: string, results: SearchResult[]): SearchResult | null {
 }
 
 /** 답변 글을 조각으로 나눈다. 인용 번호는 눌러볼 수 있는 조각이 된다. */
+/** 답변 속 인용 번호로 연 원문의 키. */
+function citeKey(turnId: number, ruleId: string) {
+  return `${turnId}:cite:${ruleId}`;
+}
+
+/** "검색된 조항" 목록에서 연 원문의 키. */
+function listKey(turnId: number, ruleId: string) {
+  return `${turnId}:list:${ruleId}`;
+}
+
 function splitAnswer(text: string, results: SearchResult[]) {
   const parts: ({ text: string } | { cited: string; rule: SearchResult })[] = [];
   let at = 0;
@@ -89,14 +96,11 @@ export default function Home() {
   // 조항 목록은 한 번에 한 질문 것만 펼친다. 한 질문에 30개씩 나와서
   // 다 펼쳐두면 지난 질문을 찾아보기가 어렵다.
   const [openRules, setOpenRules] = useState<number | null>(null);
-  // 길게 잘린 조항 중 펼쳐본 것들. 같은 조항이 여러 질문에 나올 수 있어
-  // 질문 id까지 붙여서 구분한다.
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  // 답변 속 인용 번호를 눌러 고정해둔 것들. 마우스를 올리면 잠깐 보이고,
-  // 누르면 치울 때까지 남는다. 손가락으로 쓰는 화면에는 올리기가 없어서
-  // 누르기가 본 동작이다.
-  const [pinnedCites, setPinnedCites] = useState<Set<string>>(new Set());
-  const [hoverCite, setHoverCite] = useState<string | null>(null);
+  // 지금 원문을 펼친 조항. 화면 전체에서 하나만 펼친다(261030). 답변 속 인용
+  // 번호를 누르거나 올린 것, 목록에서 누른 것이 모두 여기 들어가서, 새로 열면
+  // 앞의 것은 닫힌다. 여러 개를 열어두게 했더니 원문이 쌓여 답변을 찾기 어려웠다.
+  // 키는 citeKey/listKey로 만든다. 같은 조항이 여러 질문에 나올 수 있어 질문 id를 붙인다.
+  const [openText, setOpenText] = useState<string | null>(null);
 
   // 재검색으로 중간의 질문이 다시 진행 중이 될 수 있어 전부 본다.
   const busy = turns.some((t) => t.searching || t.answering);
@@ -144,9 +148,7 @@ export default function Home() {
   function startNewChat() {
     updateTurns(() => []);
     setOpenRules(null);
-    setExpanded(new Set());
-    setPinnedCites(new Set());
-    setHoverCite(null);
+    setOpenText(null);
     setMessage("");
     recall.current = null;
     stick.current = true;
@@ -202,35 +204,29 @@ export default function Home() {
   }
 
   /**
-   * 열어둔 원문을 닫는다.
+   * 원문을 열고 닫는다. 이미 열려 있으면 닫고, 아니면 앞의 것을 닫고 연다.
    *
-   * 마우스를 올려 연 것도 여기서만 닫는다. 커서가 벗어났다고 닫으면,
-   * 아래로 읽어 내려가는 순간 사라진다. 조항 하나가 4,000자까지 되므로
-   * 마우스를 올려둔 채로 읽는 건 불가능하다.
+   * 마우스를 올려 연 것도 커서가 벗어났다고 닫지 않는다. 그러면 아래로 읽어
+   * 내려가는 순간 사라진다. 조항 하나가 4,000자까지 되므로 마우스를 올려둔
+   * 채로 읽는 건 불가능하다. 닫기는 '닫기', 다시 누르기, 다른 조항 열기로 한다.
    */
-  function closeCite(key: string) {
-    setPinnedCites((prev) => {
-      const next = new Set(prev);
-      next.delete(key);
-      return next;
-    });
-    setHoverCite((h) => (h === key ? null : h));
+  function toggleText(key: string) {
+    setOpenText((o) => (o === key ? null : key));
   }
 
-  function toggleCite(key: string) {
-    if (pinnedCites.has(key) || hoverCite === key) {
-      closeCite(key);
+  /** "검색된 조항" 목록을 펼치고 첫 조항 하나만 원문을 연다. */
+  function showRules(turnId: number, results: SearchResult[] | null) {
+    setOpenRules(turnId);
+    if (results?.[0]) setOpenText(listKey(turnId, results[0].id));
+  }
+
+  function toggleRules(turn: Turn) {
+    if (openRules === turn.id) {
+      setOpenRules(null);
+      setOpenText((o) => (o?.startsWith(`${turn.id}:list:`) ? null : o));
       return;
     }
-    setPinnedCites((prev) => new Set(prev).add(key));
-  }
-
-  function toggleExpanded(key: string) {
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (!next.delete(key)) next.add(key);
-      return next;
-    });
+    showRules(turn.id, turn.results);
   }
 
   function handleSubmit(e: React.FormEvent) {
@@ -288,10 +284,8 @@ export default function Home() {
       reported: undefined,
     });
     // 이 질문에서 열어둔 원문과 목록은 새 결과와 안 맞으니 닫는다.
-    const mine = `${turn.id}:`;
     setOpenRules((o) => (o === turn.id ? null : o));
-    setPinnedCites((prev) => new Set([...prev].filter((k) => !k.startsWith(mine))));
-    setHoverCite((h) => (h?.startsWith(mine) ? null : h));
+    setOpenText((o) => (o?.startsWith(`${turn.id}:`) ? null : o));
     // 처음 물었을 때와 같은 앞 대화로 다시 묻는다.
     void ask(turn.id, turn.question, turn.history ?? []);
   }
@@ -344,11 +338,13 @@ export default function Home() {
     answerPromise.catch(() => null);
 
     // 1단계: 검색 결과를 먼저 받아 즉시 보여준다.
+    let results: SearchResult[] = [];
     try {
       const res = await searchPromise;
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "검색 실패");
-      patch(id, { results: data.results, searching: false });
+      results = data.results;
+      patch(id, { results, searching: false });
     } catch (err) {
       patch(id, {
         searchError: err instanceof Error ? err.message : "알 수 없는 오류",
@@ -387,7 +383,7 @@ export default function Home() {
           answerError: err instanceof Error ? err.message : "답변 생성 실패",
           answering: false,
         });
-        setOpenRules(id);
+        showRules(id, results);
         return;
       }
     }
@@ -402,8 +398,8 @@ export default function Home() {
       answering: false,
     });
     // 모델이 두 번 다 아무것도 내놓지 못하면 빈 채로 끝난다.
-    // 그때는 검색된 조항이라도 바로 보이게 펼쳐둔다.
-    if (!answer) setOpenRules(id);
+    // 그때는 검색된 조항이라도 바로 보이게 목록을 펼치고, 첫 조항을 열어둔다.
+    if (!answer) showRules(id, results);
   }
 
   return (
@@ -448,15 +444,14 @@ export default function Home() {
               const shown =
                 turn.answer && clarifying ? clarificationBody(turn.answer) : turn.answer;
               const parts = shown ? splitAnswer(shown, turn.results ?? []) : [];
-              // 지금 원문을 보여줄 조항들. 누른 것 + 마우스를 올린 것.
-              const openCites: { key: string; rule: SearchResult }[] = [];
-              for (const part of parts) {
-                if (!("rule" in part)) continue;
-                const key = `${turn.id}:${part.rule.id}`;
-                if (!pinnedCites.has(key) && hoverCite !== key) continue;
-                if (openCites.some((c) => c.key === key)) continue;
-                openCites.push({ key, rule: part.rule });
-              }
+              // 인용 번호로 연 원문. 화면 전체에서 하나뿐이다.
+              const openCite = parts.find(
+                (part) => "rule" in part && citeKey(turn.id, part.rule.id) === openText,
+              );
+              const openCites =
+                openCite && "rule" in openCite
+                  ? [{ key: citeKey(turn.id, openCite.rule.id), rule: openCite.rule }]
+                  : [];
               return (
                 <section key={turn.id} className="flex flex-col gap-3">
                   {/* 질문 */}
@@ -495,15 +490,13 @@ export default function Home() {
                           <button
                             key={i}
                             type="button"
-                            onClick={() => toggleCite(`${turn.id}:${part.rule.id}`)}
-                            // 커서가 벗어나도 닫지 않는다. 닫기는 '닫기' 버튼이나
-                            // 번호를 다시 누르는 것으로만 한다.
-                            onMouseEnter={() => setHoverCite(`${turn.id}:${part.rule.id}`)}
+                            onClick={() => toggleText(citeKey(turn.id, part.rule.id))}
+                            // 올리면 열고, 커서가 벗어나도 닫지 않는다(toggleText 참고).
+                            onMouseEnter={() => setOpenText(citeKey(turn.id, part.rule.id))}
                             title={`${part.rule.title} — 눌러서 여닫기`}
                             className={`mx-0.5 rounded px-1 font-medium underline decoration-dotted underline-offset-2 ${
-                              pinnedCites.has(`${turn.id}:${part.rule.id}`) ||
-                              hoverCite === `${turn.id}:${part.rule.id}`
-                                ? "bg-amber-200 text-black dark:bg-amber-300"
+                              openText === citeKey(turn.id, part.rule.id)
+                                ?"bg-amber-200 text-black dark:bg-amber-300"
                                 : "text-blue-700 hover:bg-zinc-100 dark:text-blue-400 dark:hover:bg-zinc-800"
                             }`}
                           >
@@ -553,7 +546,7 @@ export default function Home() {
                         </span>
                         <button
                           type="button"
-                          onClick={() => closeCite(key)}
+                          onClick={() => setOpenText(null)}
                           className="shrink-0 text-xs text-zinc-500 underline underline-offset-2 hover:text-black dark:hover:text-zinc-50"
                         >
                           닫기
@@ -606,52 +599,48 @@ export default function Home() {
                         className="cursor-pointer text-zinc-500 select-none"
                         onClick={(e) => {
                           e.preventDefault();
-                          setOpenRules(openRules === turn.id ? null : turn.id);
+                          toggleRules(turn);
                         }}
                       >
                         검색된 조항 {turn.results.length}개
                       </summary>
-                      <ul className="mt-3 flex flex-col gap-3">
+                      <ul className="mt-3 flex flex-col gap-2">
                         {turn.results.length === 0 && (
                           <li className="text-sm text-zinc-500">
                             일치하는 조항을 찾지 못했습니다.
                           </li>
                         )}
+                        {/* 제목만 늘어놓고, 누른 조항 하나만 원문을 펼친다. */}
                         {turn.results.map((r) => {
-                          const key = `${turn.id}:${r.id}`;
-                          const isLong = r.text.length > PREVIEW_CHARS;
-                          const isOpen = expanded.has(key);
+                          const key = listKey(turn.id, r.id);
+                          const isOpen = openText === key;
                           return (
                             <li
                               key={key}
-                              className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
+                              className="rounded-lg border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900"
                             >
-                              <div className="flex items-baseline justify-between gap-2">
+                              <button
+                                type="button"
+                                onClick={() => toggleText(key)}
+                                aria-expanded={isOpen}
+                                className="flex w-full items-baseline justify-between gap-2 px-4 py-3 text-left"
+                              >
                                 <span className="font-medium text-black dark:text-zinc-50">
                                   {r.id} {r.title}
                                 </span>
                                 <span className="shrink-0 text-xs text-zinc-500">
-                                  score {r.score.toFixed(3)}
+                                  {isOpen ? "접기" : "원문 보기"}
                                 </span>
-                              </div>
-                              <p className="mt-1 text-xs text-zinc-500">
-                                {r.source} · {r.chapter}
-                              </p>
-                              <p className="mt-2 text-sm whitespace-pre-line text-zinc-700 dark:text-zinc-300">
-                                {isLong && !isOpen
-                                  ? r.text.slice(0, PREVIEW_CHARS) + "…"
-                                  : r.text}
-                              </p>
-                              {isLong && (
-                                <button
-                                  type="button"
-                                  onClick={() => toggleExpanded(key)}
-                                  className="mt-2 text-xs text-zinc-500 underline underline-offset-2 hover:text-black dark:hover:text-zinc-50"
-                                >
-                                  {isOpen
-                                    ? "접기"
-                                    : `전체 보기 (${r.text.length.toLocaleString()}자)`}
-                                </button>
+                              </button>
+                              {isOpen && (
+                                <div className="px-4 pb-4">
+                                  <p className="text-xs text-zinc-500">
+                                    {r.source} · {r.chapter} · score {r.score.toFixed(3)}
+                                  </p>
+                                  <p className="mt-2 text-sm whitespace-pre-line text-zinc-700 dark:text-zinc-300">
+                                    {r.text}
+                                  </p>
+                                </div>
                               )}
                             </li>
                           );
